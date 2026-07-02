@@ -2,10 +2,16 @@
 
 Go MCP server for the Singularity v2 REST API.
 
+## Install
+
+```bash
+go install github.com/IlyasYOY/singularity-mcp/cmd/singularity-mcp@latest
+```
+
 ## Run
 
 ```bash
-go run ./cmd/singularity-mcp -token "$SINGULARITY_TOKEN"
+singularity-mcp -token "$SINGULARITY_TOKEN"
 ```
 
 Config precedence is CLI flag, then environment, then default:
