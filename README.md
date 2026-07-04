@@ -26,7 +26,7 @@ The server exposes 8 merged tools with an `operation` enum:
 
 - `singularity_projects`: `list`, `get`, `create`, `update`, `delete`
 - `singularity_task_groups`: `list`, `get`, `create`, `update`, `delete`
-- `singularity_tasks`: `list`, `inbox`, `get`, `create`, `update`, `delete`
+- `singularity_tasks`: `list`, `inbox`, `overdue`, `today`, `only-today`, `get`, `create`, `update`, `delete`
 - `singularity_habits`: `list`, `get`, `create`, `update`, `delete`
 - `singularity_habit_progress`: `list`, `get`, `create`, `update`, `delete`
 - `singularity_checklist_items`: `list`, `get`, `create`, `update`, `delete`
@@ -34,6 +34,12 @@ The server exposes 8 merged tools with an `operation` enum:
 - `singularity_time_stats`: `list`, `get`, `create`, `update`, `delete`, `delete_bulk`
 
 Kanban operations are intentionally omitted.
+
+Task date helpers are computed in the MCP client layer:
+
+- `overdue`: active tasks with `start` before today
+- `today`: active tasks with `start` today or earlier
+- `only-today`: active tasks with `start` today only
 
 ## Generate And Test
 

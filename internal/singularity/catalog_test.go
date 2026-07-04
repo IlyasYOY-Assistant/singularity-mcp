@@ -14,7 +14,7 @@ func TestCatalogCoverage(t *testing.T) {
 	if catalog.TotalOperations != 51 {
 		t.Fatalf("total ops = %d", catalog.TotalOperations)
 	}
-	if catalog.ExposedOperationCount() != 42 {
+	if catalog.ExposedOperationCount() != 45 {
 		t.Fatalf("exposed ops = %d", catalog.ExposedOperationCount())
 	}
 	if len(catalog.Groups) != 8 {
@@ -49,12 +49,14 @@ func TestCatalogOperationDetails(t *testing.T) {
 	if op.ListResponseField != "tasks" {
 		t.Fatalf("list field = %q", op.ListResponseField)
 	}
-	inbox, ok := catalog.Operation("singularity_tasks", "inbox")
-	if !ok {
-		t.Fatal("task inbox op missing")
-	}
-	if inbox.Method != op.Method || inbox.Path != op.Path || inbox.ListResponseField != op.ListResponseField {
-		t.Fatalf("task inbox = %#v", inbox)
+	for _, name := range []string{"inbox", "overdue", "today", "only-today"} {
+		taskOp, ok := catalog.Operation("singularity_tasks", name)
+		if !ok {
+			t.Fatalf("task %s op missing", name)
+		}
+		if taskOp.Method != op.Method || taskOp.Path != op.Path || taskOp.ListResponseField != op.ListResponseField {
+			t.Fatalf("task %s = %#v", name, taskOp)
+		}
 	}
 
 	create, ok := catalog.Operation("singularity_habit_progress", "create")

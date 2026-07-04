@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,6 +19,7 @@ type APIClient struct {
 	baseURL    *url.URL
 	token      string
 	httpClient *http.Client
+	now        func() time.Time
 }
 
 type APIClientOption func(*APIClient)
@@ -26,6 +28,14 @@ func WithCustomHTTPClient(httpClient *http.Client) APIClientOption {
 	return func(c *APIClient) {
 		if httpClient != nil {
 			c.httpClient = httpClient
+		}
+	}
+}
+
+func WithClock(now func() time.Time) APIClientOption {
+	return func(c *APIClient) {
+		if now != nil {
+			c.now = now
 		}
 	}
 }
@@ -44,6 +54,7 @@ func NewAPIClient(baseURL, token string, timeout time.Duration, opts ...APIClien
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
+		now: time.Now,
 	}
 	for _, opt := range opts {
 		opt(client)
@@ -70,7 +81,11 @@ func (c *APIClient) Call(ctx context.Context, op *Operation, args map[string]any
 		return nil, err
 	}
 	var raw []byte
-	if op.Name == "inbox" || (op.Name == "list" && truthy(args["all"])) {
+	today := localDate(c.now())
+	if isTaskDateListOperation(op.Name) {
+		args = taskDateListArgs(op.Name, args, today)
+		raw, err = c.callAllPages(ctx, op, args)
+	} else if op.Name == "inbox" || (op.Name == "list" && truthy(args["all"])) {
 		raw, err = c.callAllPages(ctx, op, args)
 	} else {
 		raw, err = c.callOnce(ctx, op, args, nil)
@@ -78,7 +93,7 @@ func (c *APIClient) Call(ctx context.Context, op *Operation, args map[string]any
 	if err != nil {
 		return nil, err
 	}
-	return postProcessListResponse(op, args, raw)
+	return postProcessListResponse(op, args, raw, today)
 }
 
 func (c *APIClient) callAllPages(ctx context.Context, op *Operation, args map[string]any) ([]byte, error) {
@@ -125,8 +140,8 @@ func (c *APIClient) callAllPages(ctx context.Context, op *Operation, args map[st
 	return marshalJSON(combined)
 }
 
-func postProcessListResponse(op *Operation, args map[string]any, raw []byte) ([]byte, error) {
-	if op.Name != "inbox" && !(op.Name == "list" && truthy(args["compact"])) {
+func postProcessListResponse(op *Operation, args map[string]any, raw []byte, today time.Time) ([]byte, error) {
+	if op.Name != "inbox" && !isTaskDateListOperation(op.Name) && !(op.Name == "list" && truthy(args["compact"])) {
 		return raw, nil
 	}
 
@@ -148,6 +163,9 @@ func postProcessListResponse(op *Operation, args map[string]any, raw []byte) ([]
 		if op.Name == "inbox" && !isInboxTask(m) {
 			continue
 		}
+		if isTaskDateListOperation(op.Name) && !isTaskInDateList(op.Name, m, today) {
+			continue
+		}
 		if op.Name == "inbox" || truthy(args["compact"]) {
 			out = append(out, compactEntity(m))
 		} else {
@@ -157,6 +175,89 @@ func postProcessListResponse(op *Operation, args map[string]any, raw []byte) ([]
 	page[listField] = out
 	page["count"] = len(out)
 	return marshalJSON(page)
+}
+
+func isTaskDateListOperation(name string) bool {
+	switch name {
+	case "overdue", "today", "only-today":
+		return true
+	default:
+		return false
+	}
+}
+
+func taskDateListArgs(operation string, args map[string]any, today time.Time) map[string]any {
+	out := cloneArgs(args)
+	delete(out, "all")
+	out["offset"] = float64(0)
+
+	switch operation {
+	case "overdue":
+		delete(out, "startDateFrom")
+		out["startDateTo"] = formatTaskDate(today.AddDate(0, 0, -1))
+	case "today":
+		delete(out, "startDateFrom")
+		out["startDateTo"] = formatTaskDate(today)
+	case "only-today":
+		out["startDateFrom"] = formatTaskDate(today)
+		out["startDateTo"] = formatTaskDate(today)
+	}
+	return out
+}
+
+func isTaskInDateList(operation string, task map[string]any, today time.Time) bool {
+	if !isActiveTask(task) {
+		return false
+	}
+	start, ok := taskStartDate(task, today.Location())
+	if !ok {
+		return false
+	}
+	switch operation {
+	case "overdue":
+		return start.Before(today)
+	case "today":
+		return !start.After(today)
+	case "only-today":
+		return start.Equal(today)
+	default:
+		return false
+	}
+}
+
+func isActiveTask(task map[string]any) bool {
+	if removed, ok := boolArg(task["removed"]); ok && removed {
+		return false
+	}
+	checked, ok := numberArg(task["checked"])
+	return ok && checked == 0
+}
+
+func taskStartDate(task map[string]any, location *time.Location) (time.Time, bool) {
+	start, ok := stringArg(task["start"])
+	if !ok || start == "" {
+		return time.Time{}, false
+	}
+	if len(start) >= len(taskDateLayout) {
+		start = start[:len(taskDateLayout)]
+	}
+	parsed, err := time.ParseInLocation(taskDateLayout, start, location)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+const taskDateLayout = "2006-01-02"
+
+func localDate(now time.Time) time.Time {
+	local := now.Local()
+	year, month, day := local.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, local.Location())
+}
+
+func formatTaskDate(date time.Time) string {
+	return date.Format(taskDateLayout)
 }
 
 func isInboxTask(task map[string]any) bool {
@@ -228,9 +329,7 @@ func isNoteBodyOperation(op *Operation) bool {
 
 func normalizeNoteBody(body map[string]any) (map[string]any, error) {
 	normalized := make(map[string]any, len(body))
-	for key, value := range body {
-		normalized[key] = value
-	}
+	maps.Copy(normalized, body)
 
 	noteText, hasNoteText := normalized["noteText"]
 	note, hasNote := normalized["note"]
@@ -480,9 +579,7 @@ func firstArrayField(page map[string]any) string {
 
 func cloneArgs(args map[string]any) map[string]any {
 	out := make(map[string]any, len(args))
-	for key, value := range args {
-		out[key] = value
-	}
+	maps.Copy(out, args)
 	return out
 }
 
@@ -516,6 +613,22 @@ func intArg(value any, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func numberArg(value any) (float64, bool) {
+	switch v := value.(type) {
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case float64:
+		return v, true
+	case json.Number:
+		n, err := strconv.ParseFloat(v.String(), 64)
+		return n, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func formatQueryValue(value any) string {

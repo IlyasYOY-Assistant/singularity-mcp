@@ -47,8 +47,10 @@ func TestToolSchemasAndResources(t *testing.T) {
 		if tool.Name == "singularity_tasks" {
 			raw, _ := json.Marshal(tool.InputSchema)
 			schema := string(raw)
-			if !strings.Contains(schema, "inbox") || !strings.Contains(schema, "compact") {
-				t.Fatalf("task schema missing inbox/compact: %s", raw)
+			for _, want := range []string{"inbox", "overdue", "today", "only-today", "compact"} {
+				if !strings.Contains(schema, want) {
+					t.Fatalf("task schema missing %s: %s", want, raw)
+				}
 			}
 			if !strings.Contains(schema, "noteText") || !strings.Contains(schema, "Do not pass JSON or Quill Delta") {
 				t.Fatalf("task schema missing plain note guidance: %s", raw)
@@ -81,7 +83,7 @@ func TestToolSchemasAndResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := read.Contents[0].(mcp.TextResourceContents).Text
-	if !strings.Contains(text, `"exposed":42`) || !strings.Contains(text, "kanban-status") {
+	if !strings.Contains(text, `"exposed":45`) || !strings.Contains(text, "kanban-status") {
 		t.Fatalf("capabilities = %s", text)
 	}
 }

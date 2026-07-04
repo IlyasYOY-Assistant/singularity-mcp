@@ -34,11 +34,14 @@ var tagOrder = []string{
 var operationOrder = map[string]int{
 	"list":        0,
 	"inbox":       1,
-	"get":         2,
-	"create":      3,
-	"update":      4,
-	"delete":      5,
-	"delete_bulk": 6,
+	"overdue":     2,
+	"today":       3,
+	"only-today":  4,
+	"get":         5,
+	"create":      6,
+	"update":      7,
+	"delete":      8,
+	"delete_bulk": 9,
 }
 
 type Catalog struct {
@@ -200,18 +203,30 @@ func (c *Catalog) addSyntheticOperations() {
 	if !ok {
 		return
 	}
-	inbox := &Operation{
-		Name:              "inbox",
-		Method:            listOp.Method,
-		Path:              listOp.Path,
-		OperationID:       "TaskControllerInbox",
-		Summary:           "Get inbox tasks",
-		Tag:               listOp.Tag,
-		QueryParams:       append([]Parameter(nil), listOp.QueryParams...),
-		ListResponseField: listOp.ListResponseField,
+	specs := []struct {
+		name        string
+		operationID string
+		summary     string
+	}{
+		{"inbox", "TaskControllerInbox", "Get inbox tasks"},
+		{"overdue", "TaskControllerOverdue", "Get overdue active tasks"},
+		{"today", "TaskControllerToday", "Get overdue and today's active tasks"},
+		{"only-today", "TaskControllerOnlyToday", "Get today's active tasks"},
 	}
-	group.Operations = append(group.Operations, inbox)
-	c.operationsByKey[operationKey(group.ToolName, inbox.Name)] = inbox
+	for _, spec := range specs {
+		op := &Operation{
+			Name:              spec.name,
+			Method:            listOp.Method,
+			Path:              listOp.Path,
+			OperationID:       spec.operationID,
+			Summary:           spec.summary,
+			Tag:               listOp.Tag,
+			QueryParams:       append([]Parameter(nil), listOp.QueryParams...),
+			ListResponseField: listOp.ListResponseField,
+		}
+		group.Operations = append(group.Operations, op)
+		c.operationsByKey[operationKey(group.ToolName, op.Name)] = op
+	}
 }
 
 func (c *Catalog) sortGroupsAndOperations() {

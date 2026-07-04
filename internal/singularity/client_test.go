@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -405,6 +406,149 @@ func TestClientInboxOperationFiltersAndCompactsTasks(t *testing.T) {
 	}
 }
 
+func TestClientTaskDateOperationsFilterActiveTasks(t *testing.T) {
+	catalog := testCatalog(t)
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.Local)
+
+	tests := []struct {
+		name              string
+		operation         string
+		wantIDs           []string
+		wantStartDateFrom string
+		wantStartDateTo   string
+	}{
+		{
+			name:              "overdue",
+			operation:         "overdue",
+			wantIDs:           []string{"T-overdue", "T-overdue-datetime", "T-complete-field"},
+			wantStartDateFrom: "",
+			wantStartDateTo:   "2026-07-03",
+		},
+		{
+			name:              "today",
+			operation:         "today",
+			wantIDs:           []string{"T-overdue", "T-overdue-datetime", "T-today", "T-complete-field"},
+			wantStartDateFrom: "",
+			wantStartDateTo:   "2026-07-04",
+		},
+		{
+			name:              "only today",
+			operation:         "only-today",
+			wantIDs:           []string{"T-today"},
+			wantStartDateFrom: "2026-07-04",
+			wantStartDateTo:   "2026-07-04",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, ok := catalog.Operation("singularity_tasks", tt.operation)
+			if !ok {
+				t.Fatalf("%s op missing", tt.operation)
+			}
+
+			var gotQuery string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]any{"tasks": taskDateFixture()})
+			}))
+			defer srv.Close()
+
+			client := testClientAt(t, srv.URL, now)
+			raw, err := client.Call(context.Background(), op, map[string]any{
+				"compact":                       false,
+				"includeArchived":               true,
+				"maxCount":                      float64(1),
+				"offset":                        float64(25),
+				"projectId":                     "P-1",
+				"startDateFrom":                 "2020-01-01",
+				"startDateTo":                   "2099-01-01",
+				"includeAllRecurrenceInstances": true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			query, err := url.ParseQuery(gotQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if query.Get("maxCount") != "1000" || query.Get("offset") != "0" {
+				t.Fatalf("pagination query = %s", gotQuery)
+			}
+			if query.Get("projectId") != "P-1" || query.Get("includeArchived") != "true" || query.Get("includeAllRecurrenceInstances") != "true" {
+				t.Fatalf("filters query = %s", gotQuery)
+			}
+			if query.Get("startDateFrom") != tt.wantStartDateFrom || query.Get("startDateTo") != tt.wantStartDateTo {
+				t.Fatalf("date query = %s", gotQuery)
+			}
+
+			var decoded struct {
+				Count int              `json:"count"`
+				Tasks []map[string]any `json:"tasks"`
+			}
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Count != len(tt.wantIDs) {
+				t.Fatalf("count = %d, tasks = %#v", decoded.Count, decoded.Tasks)
+			}
+			if got := taskIDs(decoded.Tasks); strings.Join(got, ",") != strings.Join(tt.wantIDs, ",") {
+				t.Fatalf("tasks = %v, want %v", got, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestClientTaskDateOperationsSupportCompact(t *testing.T) {
+	catalog := testCatalog(t)
+	op, ok := catalog.Operation("singularity_tasks", "today")
+	if !ok {
+		t.Fatal("today op missing")
+	}
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.Local)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"tasks": []map[string]any{
+			{
+				"id":              "T-today",
+				"title":           "Today",
+				"start":           "2026-07-04",
+				"checked":         float64(0),
+				"removed":         false,
+				"modificated":     map[string]any{"title": float64(1)},
+				"parentOrder":     float64(10),
+				"modificatedDate": "2026-07-04T09:00:00+03:00",
+			},
+		}})
+	}))
+	defer srv.Close()
+
+	client := testClientAt(t, srv.URL, now)
+	raw, err := client.Call(context.Background(), op, map[string]any{"compact": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Count int              `json:"count"`
+		Tasks []map[string]any `json:"tasks"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Count != 1 || decoded.Tasks[0]["id"] != "T-today" || decoded.Tasks[0]["start"] != "2026-07-04" {
+		t.Fatalf("decoded = %#v", decoded)
+	}
+	if _, ok := decoded.Tasks[0]["modificated"]; ok {
+		t.Fatalf("task was not compacted: %#v", decoded.Tasks[0])
+	}
+	if _, ok := decoded.Tasks[0]["parentOrder"]; ok {
+		t.Fatalf("task was not compacted: %#v", decoded.Tasks[0])
+	}
+}
+
 func testCatalog(t *testing.T) *Catalog {
 	t.Helper()
 	catalog, err := NewCatalog(openapi.Snapshot)
@@ -421,4 +565,38 @@ func testClient(t *testing.T, baseURL string) *APIClient {
 		t.Fatal(err)
 	}
 	return client
+}
+
+func testClientAt(t *testing.T, baseURL string, now time.Time) *APIClient {
+	t.Helper()
+	client, err := NewAPIClient(baseURL, "secret-token", time.Second, WithClock(func() time.Time {
+		return now
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func taskDateFixture() []map[string]any {
+	return []map[string]any{
+		{"id": "T-overdue", "title": "Overdue", "start": "2026-07-03", "checked": float64(0), "removed": false},
+		{"id": "T-overdue-datetime", "title": "Overdue datetime", "start": "2026-07-02T08:00:00+03:00", "checked": float64(0), "removed": false},
+		{"id": "T-today", "title": "Today", "start": "2026-07-04T09:00:00+03:00", "checked": float64(0), "removed": false},
+		{"id": "T-future", "title": "Future", "start": "2026-07-05", "checked": float64(0), "removed": false},
+		{"id": "T-done", "title": "Done", "start": "2026-07-03", "checked": float64(1), "removed": false},
+		{"id": "T-cancelled", "title": "Cancelled", "start": "2026-07-04", "checked": float64(2), "removed": false},
+		{"id": "T-removed", "title": "Removed", "start": "2026-07-03", "checked": float64(0), "removed": true},
+		{"id": "T-missing-start", "title": "Missing start", "checked": float64(0), "removed": false},
+		{"id": "T-complete-field", "title": "Complete field", "start": "2026-07-03", "checked": float64(0), "complete": float64(100), "removed": false},
+	}
+}
+
+func taskIDs(tasks []map[string]any) []string {
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		id, _ := task["id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
 }
