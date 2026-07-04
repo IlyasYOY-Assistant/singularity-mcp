@@ -4,8 +4,16 @@ Go MCP server for the Singularity v2 REST API.
 
 ## Install
 
+Install the latest published version:
+
 ```bash
 go install github.com/IlyasYOY/singularity-mcp/cmd/singularity-mcp@latest
+```
+
+Install the current local checkout:
+
+```bash
+make install
 ```
 
 ## Run
@@ -43,10 +51,14 @@ Task date helpers are computed in the MCP client layer:
 
 ## Generate And Test
 
+`make check` applies Go fixers before running vet and tests.
+
 ```bash
 make check
+make fix
 make test
 make vet
 make generate
+make install
 make version
 ```

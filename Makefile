@@ -2,9 +2,12 @@
 
 GO ?= go
 
-.PHONY: check test vet generate version
+.PHONY: check fix test vet generate install version
 
-check: test vet
+check: fix vet test
+
+fix:
+	$(GO) fix ./...
 
 test:
 	$(GO) test ./...
@@ -14,6 +17,9 @@ vet:
 
 generate:
 	$(GO) generate ./...
+install:
+	$(GO) install ./cmd/singularity-mcp
+
 
 version:
 	$(GO) run ./cmd/singularity-mcp -version

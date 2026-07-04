@@ -31,7 +31,6 @@ func NewServer(client *singularity.APIClient, catalog *singularity.Catalog, vers
 
 func (b Builder) Register(mcpServer *server.MCPServer) {
 	for _, group := range b.Catalog.Groups {
-		group := group
 		mcpServer.AddTool(toolForGroup(group), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return b.handleTool(ctx, group, req)
 		})
