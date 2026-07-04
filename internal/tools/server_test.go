@@ -12,7 +12,9 @@ import (
 	"github.com/IlyasYOY/singularity-mcp/internal/singularity"
 	"github.com/IlyasYOY/singularity-mcp/openapi"
 	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestToolSchemasAndResources(t *testing.T) {
@@ -176,6 +178,132 @@ func TestToolValidationAndAPIErrors(t *testing.T) {
 	if !strings.Contains(got, `"status":403`) || strings.Contains(got, "secret-token") {
 		t.Fatalf("api error = %s", got)
 	}
+}
+
+func TestRequireWriteApprovalAllowsReadsWithoutElicitation(t *testing.T) {
+	catalog := testCatalog(t)
+	var httpCalls int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"projects":[]}`))
+	}))
+	defer api.Close()
+
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: true})
+	handler := &testElicitationHandler{action: mcp.ElicitationResponseActionAccept, approved: true}
+	c := newInProcessClientWithElicitation(t, srv, handler)
+	defer c.Close()
+	startClient(t, c)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "singularity_projects"
+	req.Params.Arguments = map[string]any{"operation": "list"}
+	result, err := c.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("tool error: %s", resultText(result))
+	}
+	if handler.calls != 0 {
+		t.Fatalf("elicitation calls = %d", handler.calls)
+	}
+	if httpCalls != 1 {
+		t.Fatalf("http calls = %d", httpCalls)
+	}
+}
+
+func TestRequireWriteApprovalBlocksDeclinedWritesBeforeAPICall(t *testing.T) {
+	catalog := testCatalog(t)
+	var httpCalls int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer api.Close()
+
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: true})
+	handler := &testElicitationHandler{action: mcp.ElicitationResponseActionDecline}
+	c := newInProcessClientWithElicitation(t, srv, handler)
+	defer c.Close()
+	startClient(t, c)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "singularity_projects"
+	req.Params.Arguments = map[string]any{"operation": "delete", "id": "id-1", "confirm": true}
+	result, err := c.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(resultText(result), "write operation blocked") {
+		t.Fatalf("expected approval error, got: %s", resultText(result))
+	}
+	if handler.calls != 1 {
+		t.Fatalf("elicitation calls = %d", handler.calls)
+	}
+	if !strings.Contains(handler.last.Params.Message, "tool=singularity_projects") || !strings.Contains(handler.last.Params.Message, "operation=delete") || !strings.Contains(handler.last.Params.Message, "id=id-1") {
+		t.Fatalf("approval message = %q", handler.last.Params.Message)
+	}
+	if httpCalls != 0 {
+		t.Fatalf("http calls = %d", httpCalls)
+	}
+}
+
+func TestRequireWriteApprovalAllowsApprovedWrites(t *testing.T) {
+	catalog := testCatalog(t)
+	var httpCalls int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"created"}`))
+	}))
+	defer api.Close()
+
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: true})
+	handler := &testElicitationHandler{action: mcp.ElicitationResponseActionAccept, approved: true}
+	c := newInProcessClientWithElicitation(t, srv, handler)
+	defer c.Close()
+	startClient(t, c)
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "singularity_projects"
+	req.Params.Arguments = map[string]any{"operation": "create", "body": map[string]any{"title": "new"}}
+	result, err := c.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("tool error: %s", resultText(result))
+	}
+	if handler.calls != 1 {
+		t.Fatalf("elicitation calls = %d", handler.calls)
+	}
+	if httpCalls != 1 {
+		t.Fatalf("http calls = %d", httpCalls)
+	}
+}
+
+type testElicitationHandler struct {
+	action   mcp.ElicitationResponseAction
+	approved bool
+	calls    int
+	last     mcp.ElicitationRequest
+}
+
+func (h *testElicitationHandler) Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+	_ = ctx
+	h.calls++
+	h.last = request
+	return &mcp.ElicitationResult{ElicitationResponse: mcp.ElicitationResponse{
+		Action:  h.action,
+		Content: map[string]any{"approved": h.approved},
+	}}, nil
+}
+
+func newInProcessClientWithElicitation(t *testing.T, srv *server.MCPServer, handler *testElicitationHandler) *client.Client {
+	t.Helper()
+	return client.NewClient(transport.NewInProcessTransportWithOptions(srv, transport.WithElicitationHandler(handler)))
 }
 
 func testCatalog(t *testing.T) *singularity.Catalog {

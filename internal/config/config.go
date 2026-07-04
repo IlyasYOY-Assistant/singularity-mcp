@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -15,9 +16,10 @@ const (
 )
 
 type Config struct {
-	Token   string
-	BaseURL string
-	Timeout time.Duration
+	Token                string
+	BaseURL              string
+	Timeout              time.Duration
+	RequireWriteApproval bool
 }
 
 type Result struct {
@@ -34,9 +36,21 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	versionRequested := hasVersionFlag(args)
 
 	cfg := Config{
-		Token:   getenv("SINGULARITY_TOKEN"),
-		BaseURL: valueOrDefault(getenv("SINGULARITY_BASE_URL"), DefaultBaseURL),
-		Timeout: DefaultTimeout,
+		Token:                getenv("SINGULARITY_TOKEN"),
+		BaseURL:              valueOrDefault(getenv("SINGULARITY_BASE_URL"), DefaultBaseURL),
+		Timeout:              DefaultTimeout,
+		RequireWriteApproval: false,
+	}
+	if raw := getenv("SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL"); raw != "" {
+		requireWriteApproval, err := strconv.ParseBool(raw)
+		if err != nil {
+			if versionRequested {
+				requireWriteApproval = false
+			} else {
+				return Result{}, fmt.Errorf("parse SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL: %w", err)
+			}
+		}
+		cfg.RequireWriteApproval = requireWriteApproval
 	}
 	if raw := getenv("SINGULARITY_TIMEOUT"); raw != "" {
 		timeout, err := time.ParseDuration(raw)
@@ -57,6 +71,7 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	token := fs.String("token", cfg.Token, "Singularity API bearer token")
 	baseURL := fs.String("base-url", cfg.BaseURL, "Singularity API base URL")
 	timeout := fs.Duration("timeout", cfg.Timeout, "HTTP request timeout")
+	requireWriteApproval := fs.Bool("require-write-approval", cfg.RequireWriteApproval, "require MCP elicitation approval before write operations")
 	versionOnly := fs.Bool("version", false, "print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return Result{}, err
@@ -65,6 +80,7 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	cfg.Token = *token
 	cfg.BaseURL = *baseURL
 	cfg.Timeout = *timeout
+	cfg.RequireWriteApproval = *requireWriteApproval
 	if *versionOnly {
 		return Result{Config: cfg, VersionOnly: true}, nil
 	}

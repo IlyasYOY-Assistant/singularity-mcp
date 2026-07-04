@@ -7,14 +7,16 @@ import (
 
 func TestParsePrecedence(t *testing.T) {
 	env := map[string]string{
-		"SINGULARITY_TOKEN":    "env-token",
-		"SINGULARITY_BASE_URL": "https://env.example",
-		"SINGULARITY_TIMEOUT":  "10s",
+		"SINGULARITY_TOKEN":                      "env-token",
+		"SINGULARITY_BASE_URL":                   "https://env.example",
+		"SINGULARITY_TIMEOUT":                    "10s",
+		"SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL": "false",
 	}
 	got, err := Parse([]string{
 		"-token", "cli-token",
 		"-base-url", "https://cli.example",
 		"-timeout", "5s",
+		"-require-write-approval",
 	}, func(key string) string { return env[key] })
 	if err != nil {
 		t.Fatal(err)
@@ -27,6 +29,24 @@ func TestParsePrecedence(t *testing.T) {
 	}
 	if got.Config.Timeout != 5*time.Second {
 		t.Fatalf("timeout = %s", got.Config.Timeout)
+	}
+	if !got.Config.RequireWriteApproval {
+		t.Fatal("RequireWriteApproval = false")
+	}
+}
+
+func TestParseRequireWriteApprovalFromEnv(t *testing.T) {
+	got, err := Parse(nil, func(key string) string {
+		if key == "SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL" {
+			return "true"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Config.RequireWriteApproval {
+		t.Fatal("RequireWriteApproval = false")
 	}
 }
 
@@ -83,6 +103,7 @@ func TestParseRejectsBadInputs(t *testing.T) {
 		env  map[string]string
 	}{
 		{name: "bad env timeout", env: map[string]string{"SINGULARITY_TIMEOUT": "nope"}},
+		{name: "bad approval flag", env: map[string]string{"SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL": "sometimes"}},
 		{name: "bad base url", args: []string{"-token", "tok", "-base-url", "api.example"}},
 		{name: "zero timeout", args: []string{"-token", "tok", "-timeout", "0s"}},
 	}

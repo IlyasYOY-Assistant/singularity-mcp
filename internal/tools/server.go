@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/IlyasYOY/singularity-mcp/internal/singularity"
 	"github.com/IlyasYOY/singularity-mcp/openapi"
@@ -12,19 +13,37 @@ import (
 )
 
 type Builder struct {
-	Client  *singularity.APIClient
-	Catalog *singularity.Catalog
+	Client               *singularity.APIClient
+	Catalog              *singularity.Catalog
+	Server               *server.MCPServer
+	RequireWriteApproval bool
+}
+
+// Options configures optional MCP server behavior.
+type Options struct {
+	RequireWriteApproval bool
 }
 
 func NewServer(client *singularity.APIClient, catalog *singularity.Catalog, version string) *server.MCPServer {
-	mcpServer := server.NewMCPServer(
-		"singularity-mcp",
-		version,
+	return NewServerWithOptions(client, catalog, version, Options{})
+}
+
+// NewServerWithOptions creates a Singularity MCP server with optional safeguards.
+func NewServerWithOptions(client *singularity.APIClient, catalog *singularity.Catalog, version string, options Options) *server.MCPServer {
+	serverOptions := []server.ServerOption{
 		server.WithToolCapabilities(false),
 		server.WithResourceCapabilities(false, false),
 		server.WithRecovery(),
+	}
+	if options.RequireWriteApproval {
+		serverOptions = append(serverOptions, server.WithElicitation())
+	}
+	mcpServer := server.NewMCPServer(
+		"singularity-mcp",
+		version,
+		serverOptions...,
 	)
-	builder := Builder{Client: client, Catalog: catalog}
+	builder := Builder{Client: client, Catalog: catalog, Server: mcpServer, RequireWriteApproval: options.RequireWriteApproval}
 	builder.Register(mcpServer)
 	return mcpServer
 }
@@ -65,11 +84,84 @@ func (b Builder) handleTool(ctx context.Context, group *singularity.ToolGroup, r
 	if !ok {
 		return mcp.NewToolResultError(singularity.StructuredError(singularity.NewValidationError("invalid operation: " + operationName))), nil
 	}
+	if approvalResult, proceed := b.requireWriteApproval(ctx, group.ToolName, operationName, args); !proceed {
+		return approvalResult, nil
+	}
 	raw, err := b.Client.Call(ctx, op, args)
 	if err != nil {
 		return mcp.NewToolResultError(singularity.StructuredError(err)), nil
 	}
 	return mcp.NewToolResultText(string(raw)), nil
+}
+
+func (b Builder) requireWriteApproval(ctx context.Context, toolName, operationName string, args map[string]any) (*mcp.CallToolResult, bool) {
+	if !b.RequireWriteApproval || isReadOperation(operationName) {
+		return nil, true
+	}
+
+	mcpServer := b.Server
+	if mcpServer == nil {
+		mcpServer = server.ServerFromContext(ctx)
+	}
+	if mcpServer == nil {
+		return mcp.NewToolResultError("write operation blocked: approval session unavailable"), false
+	}
+
+	result, err := mcpServer.RequestElicitation(ctx, mcp.ElicitationRequest{
+		Params: mcp.ElicitationParams{
+			Message: approvalMessage(toolName, operationName, args),
+			RequestedSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"approved": map[string]any{
+						"type":        "boolean",
+						"description": "Approve this Singularity write operation.",
+					},
+				},
+				"required": []string{"approved"},
+			},
+		},
+	})
+	if err != nil {
+		return mcp.NewToolResultError("write operation blocked: approval request failed: " + err.Error()), false
+	}
+	if result.Action != mcp.ElicitationResponseActionAccept || !approvalAccepted(result.Content) {
+		return mcp.NewToolResultError("write operation blocked: user did not approve"), false
+	}
+	return nil, true
+}
+
+func approvalAccepted(content any) bool {
+	fields, ok := content.(map[string]any)
+	if !ok {
+		return false
+	}
+	approved, ok := fields["approved"].(bool)
+	return ok && approved
+}
+
+func isReadOperation(operationName string) bool {
+	switch operationName {
+	case "list", "get", "inbox", "overdue", "today", "only-today":
+		return true
+	default:
+		return false
+	}
+}
+
+func approvalMessage(toolName, operationName string, args map[string]any) string {
+	parts := []string{
+		"Approve Singularity write operation?",
+		"tool=" + toolName,
+		"operation=" + operationName,
+	}
+	if id, ok := args["id"].(string); ok && id != "" {
+		parts = append(parts, "id="+id)
+	}
+	if _, ok := args["body"]; ok {
+		parts = append(parts, "body=present")
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (b Builder) readResource(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
