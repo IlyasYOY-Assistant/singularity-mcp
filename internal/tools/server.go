@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/IlyasYOY/singularity-mcp/internal/singularity"
 	"github.com/IlyasYOY/singularity-mcp/openapi"
@@ -12,19 +15,37 @@ import (
 )
 
 type Builder struct {
-	Client  *singularity.APIClient
-	Catalog *singularity.Catalog
+	Client               *singularity.APIClient
+	Catalog              *singularity.Catalog
+	Server               *server.MCPServer
+	RequireWriteApproval bool
+}
+
+// Options configures optional MCP server behavior.
+type Options struct {
+	RequireWriteApproval bool
 }
 
 func NewServer(client *singularity.APIClient, catalog *singularity.Catalog, version string) *server.MCPServer {
-	mcpServer := server.NewMCPServer(
-		"singularity-mcp",
-		version,
+	return NewServerWithOptions(client, catalog, version, Options{RequireWriteApproval: true})
+}
+
+// NewServerWithOptions creates a Singularity MCP server with optional safeguards.
+func NewServerWithOptions(client *singularity.APIClient, catalog *singularity.Catalog, version string, options Options) *server.MCPServer {
+	serverOptions := []server.ServerOption{
 		server.WithToolCapabilities(false),
 		server.WithResourceCapabilities(false, false),
 		server.WithRecovery(),
+	}
+	if options.RequireWriteApproval {
+		serverOptions = append(serverOptions, server.WithElicitation())
+	}
+	mcpServer := server.NewMCPServer(
+		"singularity-mcp",
+		version,
+		serverOptions...,
 	)
-	builder := Builder{Client: client, Catalog: catalog}
+	builder := Builder{Client: client, Catalog: catalog, Server: mcpServer, RequireWriteApproval: options.RequireWriteApproval}
 	builder.Register(mcpServer)
 	return mcpServer
 }
@@ -65,11 +86,147 @@ func (b Builder) handleTool(ctx context.Context, group *singularity.ToolGroup, r
 	if !ok {
 		return mcp.NewToolResultError(singularity.StructuredError(singularity.NewValidationError("invalid operation: " + operationName))), nil
 	}
+	if approvalResult, proceed := b.requireWriteApproval(ctx, group.ToolName, op, args); !proceed {
+		return approvalResult, nil
+	}
 	raw, err := b.Client.Call(ctx, op, args)
 	if err != nil {
 		return mcp.NewToolResultError(singularity.StructuredError(err)), nil
 	}
 	return mcp.NewToolResultText(string(raw)), nil
+}
+
+func (b Builder) requireWriteApproval(ctx context.Context, toolName string, op *singularity.Operation, args map[string]any) (*mcp.CallToolResult, bool) {
+	if !b.RequireWriteApproval || !operationRequiresApproval(op) {
+		return nil, true
+	}
+
+	mcpServer := b.Server
+	if mcpServer == nil {
+		mcpServer = server.ServerFromContext(ctx)
+	}
+	if mcpServer == nil {
+		return mcp.NewToolResultError("write operation blocked: approval session unavailable"), false
+	}
+	if !clientSupportsElicitation(ctx) {
+		return mcp.NewToolResultError("write operation blocked: client does not support elicitation"), false
+	}
+
+	result, err := mcpServer.RequestElicitation(ctx, mcp.ElicitationRequest{
+		Params: mcp.ElicitationParams{
+			Message: approvalMessage(toolName, op, args),
+			RequestedSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"approved": map[string]any{
+						"type":        "boolean",
+						"description": "Approve this Singularity write operation.",
+					},
+				},
+				"required": []string{"approved"},
+			},
+		},
+	})
+	if err != nil {
+		return mcp.NewToolResultError("write operation blocked: approval request failed: " + err.Error()), false
+	}
+	if result.Action != mcp.ElicitationResponseActionAccept || !approvalAccepted(result.Content) {
+		return mcp.NewToolResultError("write operation blocked: user did not approve"), false
+	}
+	return nil, true
+}
+
+func clientSupportsElicitation(ctx context.Context) bool {
+	session := server.ClientSessionFromContext(ctx)
+	if session == nil {
+		return false
+	}
+	if _, ok := session.(server.SessionWithElicitation); !ok {
+		return false
+	}
+	withInfo, ok := session.(server.SessionWithClientInfo)
+	if !ok {
+		return false
+	}
+	capabilities := withInfo.GetClientCapabilities()
+	return capabilities.Elicitation != nil
+}
+
+func approvalAccepted(content any) bool {
+	fields, ok := content.(map[string]any)
+	if !ok {
+		return false
+	}
+	approved, ok := fields["approved"].(bool)
+	return ok && approved
+}
+
+func operationRequiresApproval(op *singularity.Operation) bool {
+	return op == nil || op.Method != http.MethodGet
+}
+
+const approvalPreviewLimit = 500
+
+func approvalMessage(toolName string, op *singularity.Operation, args map[string]any) string {
+	operationName := ""
+	method := ""
+	path := ""
+	if op != nil {
+		operationName = op.Name
+		method = op.Method
+		path = op.Path
+	}
+	parts := []string{
+		"Approve Singularity write operation?",
+		"tool=" + toolName,
+		"operation=" + operationName,
+		"method=" + method,
+		"path=" + path,
+	}
+	if id, ok := args["id"].(string); ok && id != "" {
+		parts = append(parts, "id="+id)
+	}
+	if preview := approvalArgsPreview(args); preview != "" {
+		parts = append(parts, "args="+preview)
+	}
+	if body, ok := args["body"]; ok {
+		parts = append(parts, "body="+boundedPreview(body, approvalPreviewLimit))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func approvalArgsPreview(args map[string]any) string {
+	if len(args) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(args))
+	for key := range args {
+		switch key {
+		case "operation", "body", "confirm":
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	preview := make(map[string]any, len(keys))
+	for _, key := range keys {
+		preview[key] = args[key]
+	}
+	return boundedPreview(preview, approvalPreviewLimit)
+}
+
+func boundedPreview(value any, limit int) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		raw = fmt.Append(nil, value)
+	}
+	if len(raw) <= limit {
+		return string(raw)
+	}
+	return string(raw[:limit]) + "…"
 }
 
 func (b Builder) readResource(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
@@ -82,7 +239,7 @@ func (b Builder) readResource(ctx context.Context, req mcp.ReadResourceRequest) 
 			Text:     string(openapi.Snapshot),
 		}}, nil
 	case "singularity://capabilities":
-		raw, err := json.Marshal(capabilities(b.Catalog))
+		raw, err := json.Marshal(capabilities(b.Catalog, b.RequireWriteApproval))
 		if err != nil {
 			return nil, err
 		}
@@ -200,7 +357,7 @@ func decorateNoteBodySchema(op *singularity.Operation, body map[string]any) {
 	}
 }
 
-func capabilities(catalog *singularity.Catalog) map[string]any {
+func capabilities(catalog *singularity.Catalog, requireWriteApproval bool) map[string]any {
 	tools := make([]map[string]any, 0, len(catalog.Groups))
 	for _, group := range catalog.Groups {
 		tools = append(tools, map[string]any{
@@ -209,9 +366,10 @@ func capabilities(catalog *singularity.Catalog) map[string]any {
 		})
 	}
 	return map[string]any{
-		"tools":        tools,
-		"omittedTags":  catalog.OmittedTags,
-		"operationSet": map[string]any{"totalSwagger": catalog.TotalOperations, "exposed": catalog.ExposedOperationCount()},
+		"tools":                tools,
+		"omittedTags":          catalog.OmittedTags,
+		"operationSet":         map[string]any{"totalSwagger": catalog.TotalOperations, "exposed": catalog.ExposedOperationCount()},
+		"requireWriteApproval": requireWriteApproval,
 	}
 }
 

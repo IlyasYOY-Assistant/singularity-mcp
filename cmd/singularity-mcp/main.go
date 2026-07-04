@@ -34,7 +34,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	mcpServer := mcptools.NewServer(client, catalog, version)
+	mcpServer := mcptools.NewServerWithOptions(client, catalog, version, mcptools.Options{
+		RequireWriteApproval: result.Config.RequireWriteApproval,
+	})
 	if err := server.ServeStdio(mcpServer); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
