@@ -25,6 +25,7 @@ type Config struct {
 type Result struct {
 	Config      Config
 	VersionOnly bool
+	HelpOnly    bool
 }
 
 type Getter func(string) string
@@ -34,6 +35,7 @@ func Parse(args []string, getenv Getter) (Result, error) {
 		getenv = func(string) string { return "" }
 	}
 	versionRequested := hasVersionFlag(args)
+	helpRequested := hasHelpFlag(args)
 
 	cfg := Config{
 		Token:                getenv("SINGULARITY_TOKEN"),
@@ -44,7 +46,7 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	if raw := getenv("SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL"); raw != "" {
 		requireWriteApproval, err := strconv.ParseBool(raw)
 		if err != nil {
-			if versionRequested {
+			if versionRequested || helpRequested {
 				requireWriteApproval = cfg.RequireWriteApproval
 			} else {
 				return Result{}, fmt.Errorf("parse SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL: %w", err)
@@ -55,7 +57,7 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	if raw := getenv("SINGULARITY_TIMEOUT"); raw != "" {
 		timeout, err := time.ParseDuration(raw)
 		if err != nil {
-			if versionRequested {
+			if versionRequested || helpRequested {
 				timeout = DefaultTimeout
 			} else {
 				return Result{}, fmt.Errorf("parse SINGULARITY_TIMEOUT: %w", err)
@@ -73,6 +75,8 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	timeout := fs.Duration("timeout", cfg.Timeout, "HTTP request timeout")
 	requireWriteApproval := fs.Bool("require-write-approval", cfg.RequireWriteApproval, "require MCP elicitation approval before write operations")
 	versionOnly := fs.Bool("version", false, "print version and exit")
+	helpOnly := fs.Bool("help", false, "print help and exit")
+	helpShort := fs.Bool("h", false, "print help and exit")
 	if err := fs.Parse(args); err != nil {
 		return Result{}, err
 	}
@@ -81,6 +85,9 @@ func Parse(args []string, getenv Getter) (Result, error) {
 	cfg.BaseURL = *baseURL
 	cfg.Timeout = *timeout
 	cfg.RequireWriteApproval = *requireWriteApproval
+	if *helpOnly || *helpShort {
+		return Result{Config: cfg, HelpOnly: true}, nil
+	}
 	if *versionOnly {
 		return Result{Config: cfg, VersionOnly: true}, nil
 	}
@@ -97,6 +104,16 @@ func hasVersionFlag(args []string) bool {
 	for _, arg := range args {
 		switch arg {
 		case "-version", "--version", "-version=true", "--version=true":
+			return true
+		}
+	}
+	return false
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-help", "--help", "-help=true", "--help=true", "-h", "-h=true":
 			return true
 		}
 	}

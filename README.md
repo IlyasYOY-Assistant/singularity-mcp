@@ -29,6 +29,7 @@ Releases are created manually from GitHub Actions:
 
 ```bash
 singularity-mcp -token "$SINGULARITY_TOKEN"
+singularity-mcp -help
 ```
 
 Config precedence is CLI flag, then environment, then default:
@@ -37,6 +38,8 @@ Config precedence is CLI flag, then environment, then default:
 - `-base-url` / `SINGULARITY_BASE_URL`, default `https://api.singularity-app.com`
 - `-timeout` / `SINGULARITY_TIMEOUT`, default `30s`
 - `-require-write-approval` / `SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL`, default `true`
+- `-version` prints the CLI version and exits
+- `-help` / `-h` prints CLI usage and exits
 
 When write approval is enabled, read-only operations run normally, while write
 operations request MCP elicitation approval before the Singularity API call is

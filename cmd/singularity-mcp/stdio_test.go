@@ -8,11 +8,55 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 )
+
+func TestBinaryHelp(t *testing.T) {
+	tests := []string{"-help", "--help", "-h"}
+	for _, flag := range tests {
+		t.Run(flag, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "go", "run", ".", flag)
+			cmd.Env = append(cmd.Environ(),
+				"SINGULARITY_TOKEN=",
+				"SINGULARITY_TIMEOUT=nope",
+				"SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL=sometimes",
+			)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("run: %v, stderr: %s", err, stderr.String())
+			}
+
+			got := stdout.String()
+			for _, want := range []string{
+				"singularity-mcp 0.3.0",
+				"Usage:",
+				"-token string",
+				"-base-url string",
+				"-timeout duration",
+				"-require-write-approval",
+				"-version",
+				"-help, -h",
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("stdout missing %q in:\n%s", want, got)
+				}
+			}
+			if stderr.String() != "" {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+		})
+	}
+}
 
 func TestBinaryStdioSmoke(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

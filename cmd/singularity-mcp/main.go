@@ -13,11 +13,37 @@ import (
 
 const version = "0.3.0"
 
+func usage(version string) string {
+	return fmt.Sprintf(`singularity-mcp %s
+
+Usage:
+  singularity-mcp [flags]
+
+Flags:
+  -token string
+        Singularity API bearer token (env: SINGULARITY_TOKEN)
+  -base-url string
+        Singularity API base URL (env: SINGULARITY_BASE_URL, default: %s)
+  -timeout duration
+        HTTP request timeout (env: SINGULARITY_TIMEOUT, default: %s)
+  -require-write-approval
+        require MCP elicitation approval before write operations (env: SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL, default: true)
+  -version
+        print version and exit
+  -help, -h
+        print help and exit
+`, version, config.DefaultBaseURL, config.DefaultTimeout)
+}
+
 func main() {
 	result, err := config.Parse(os.Args[1:], os.Getenv)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
+	}
+	if result.HelpOnly {
+		fmt.Print(usage(version))
+		return
 	}
 	if result.VersionOnly {
 		fmt.Printf("singularity-mcp %s\n", version)
