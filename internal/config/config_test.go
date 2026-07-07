@@ -132,6 +132,44 @@ func TestParseVersionIgnoresBadApprovalEnv(t *testing.T) {
 	}
 }
 
+func TestParseHelpRequested(t *testing.T) {
+	tests := [][]string{
+		{"-help"},
+		{"--help"},
+		{"-h"},
+	}
+	for _, args := range tests {
+		t.Run(args[0], func(t *testing.T) {
+			got, err := Parse(args, func(string) string { return "" })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.HelpOnly {
+				t.Fatal("HelpOnly = false")
+			}
+		})
+	}
+}
+
+func TestParseHelpIgnoresBadEnv(t *testing.T) {
+	got, err := Parse([]string{"--help"}, func(key string) string {
+		switch key {
+		case "SINGULARITY_TIMEOUT":
+			return "nope"
+		case "SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL":
+			return "sometimes"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HelpOnly {
+		t.Fatal("HelpOnly = false")
+	}
+}
+
 func TestParseRejectsBadInputs(t *testing.T) {
 	tests := []struct {
 		name string
