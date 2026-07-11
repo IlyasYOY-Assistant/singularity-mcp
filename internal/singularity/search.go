@@ -2,8 +2,6 @@ package singularity
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -32,54 +30,42 @@ func (c *APIClient) search(ctx context.Context, op *Operation, args map[string]a
 		return nil, err
 	}
 	listArgs := searchListArgs(op, args)
-
-	var raw []byte
-	if options.AllPages {
-		raw, err = c.callAllPages(ctx, op, listArgs)
-	} else {
-		raw, err = c.callOnce(ctx, op, listArgs, nil)
-	}
+	listField := op.ListResponseField
+	results := make([]any, 0, options.Limit)
+	truncated := false
+	stats, err := c.iteratePages(ctx, op, listArgs, options.AllPages, func(items []any) (int, int, bool, error) {
+		for index, item := range items {
+			entity, ok := item.(map[string]any)
+			if !ok || !matchesSearch(op, options, entity) {
+				continue
+			}
+			if len(results) >= options.Limit {
+				truncated = true
+				return index + 1, index, true, nil
+			}
+			if options.Compact {
+				results = append(results, compactSearchEntity(op.Tag, entity))
+			} else {
+				results = append(results, entity)
+			}
+		}
+		return len(items), len(items), false, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var page map[string]any
-	if err := json.Unmarshal(raw, &page); err != nil {
-		return nil, fmt.Errorf("decode search response: %w", err)
+	truncated = truncated || stats.MorePossible
+	pagination := map[string]any{
+		"scannedPages":      stats.ScannedPages,
+		"scannedItems":      stats.ScannedItems,
+		"morePagesPossible": stats.MorePossible,
+		"nextOffset":        stats.NextOffset,
 	}
-	listField := op.ListResponseField
-	if listField == "" {
-		listField = firstArrayField(page)
-	}
-	items, _ := page[listField].([]any)
-
-	results := make([]any, 0, options.Limit)
-	truncated := false
-	for _, item := range items {
-		entity, ok := item.(map[string]any)
-		if !ok || !matchesSearch(op, options, entity) {
-			continue
-		}
-		if len(results) >= options.Limit {
-			truncated = true
-			break
-		}
-		if options.Compact {
-			results = append(results, compactSearchEntity(op.Tag, entity))
-		} else {
-			results = append(results, entity)
-		}
-	}
-
 	return marshalJSON(map[string]any{
-		"count":   len(results),
-		listField: results,
-		"query": map[string]any{
-			"text":      options.Query,
-			"fields":    options.Fields,
-			"limit":     options.Limit,
-			"truncated": truncated,
-		},
+		"count":      len(results),
+		listField:    results,
+		"query":      map[string]any{"text": options.Query, "fields": options.Fields, "limit": options.Limit, "truncated": truncated},
+		"pagination": pagination,
 	})
 }
 
@@ -173,6 +159,10 @@ func hasSearchCriteria(op *Operation, args map[string]any, options searchOptions
 		return true
 	}
 	for _, param := range op.QueryParams {
+		switch param.Name {
+		case "offset", "maxCount", "includeRemoved", "includeArchived", "includeAllRecurrenceInstances":
+			continue
+		}
 		if value, ok := args[param.Name]; ok && value != nil && formatQueryValue(value) != "" {
 			return true
 		}

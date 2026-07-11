@@ -10,6 +10,14 @@ type ValidationError struct {
 	Message string
 }
 
+type ClientError struct {
+	Code     string
+	Message  string
+	Metadata map[string]any
+}
+
+func (e *ClientError) Error() string { return e.Message }
+
 func NewValidationError(message string) *ValidationError {
 	return &ValidationError{Message: message}
 }
@@ -19,10 +27,13 @@ func (e *ValidationError) Error() string {
 }
 
 type APIError struct {
-	Status   int
-	Method   string
-	Path     string
-	Response string
+	Status     int
+	Method     string
+	Path       string
+	Response   string
+	Retriable  bool
+	Attempts   int
+	RetryAfter *int
 }
 
 func NewAPIError(status int, method, path string, body []byte, token string) *APIError {

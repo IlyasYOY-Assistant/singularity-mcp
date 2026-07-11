@@ -3,6 +3,7 @@ package singularity
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,13 +17,35 @@ import (
 )
 
 type APIClient struct {
-	baseURL    *url.URL
-	token      string
-	httpClient *http.Client
-	now        func() time.Time
+	baseURL          *url.URL
+	token            string
+	httpClient       *http.Client
+	now              func() time.Time
+	sleep            func(context.Context, time.Duration) error
+	maxResponseBytes int64
+	maxPages         int
+	maxItems         int
 }
 
 type APIClientOption func(*APIClient)
+
+func WithMaxResponseBytes(limit int64) APIClientOption {
+	return func(c *APIClient) {
+		if limit > 0 {
+			c.maxResponseBytes = limit
+		}
+	}
+}
+func WithPaginationLimits(maxPages, maxItems int) APIClientOption {
+	return func(c *APIClient) {
+		if maxPages > 0 {
+			c.maxPages = maxPages
+		}
+		if maxItems > 0 {
+			c.maxItems = maxItems
+		}
+	}
+}
 
 func WithCustomHTTPClient(httpClient *http.Client) APIClientOption {
 	return func(c *APIClient) {
@@ -36,6 +59,14 @@ func WithClock(now func() time.Time) APIClientOption {
 	return func(c *APIClient) {
 		if now != nil {
 			c.now = now
+		}
+	}
+}
+
+func WithSleeper(sleep func(context.Context, time.Duration) error) APIClientOption {
+	return func(c *APIClient) {
+		if sleep != nil {
+			c.sleep = sleep
 		}
 	}
 }
@@ -55,6 +86,19 @@ func NewAPIClient(baseURL, token string, timeout time.Duration, opts ...APIClien
 			Timeout: timeout,
 		},
 		now: time.Now,
+		sleep: func(ctx context.Context, delay time.Duration) error {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		maxResponseBytes: 1 << 20,
+		maxPages:         100,
+		maxItems:         10000,
 	}
 	for _, opt := range opts {
 		opt(client)
@@ -121,13 +165,46 @@ func (c *APIClient) ExecutePrepared(ctx context.Context, prepared *PreparedCall)
 }
 
 func (c *APIClient) callAllPages(ctx context.Context, op *Operation, args map[string]any) ([]byte, error) {
-	offset := intArg(args["offset"], 0)
 	combined := map[string]any{}
-	var listField string
+	listField := op.ListResponseField
+	stats, err := c.iteratePages(ctx, op, args, true, func(items []any) (int, int, bool, error) {
+		if _, ok := combined[listField]; !ok {
+			combined[listField] = []any{}
+		}
+		combined[listField] = append(combined[listField].([]any), items...)
+		return len(items), len(items), false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if stats.MorePossible {
+		combined["pagination"] = map[string]any{"scannedPages": stats.ScannedPages, "scannedItems": stats.ScannedItems, "truncated": true, "nextOffset": stats.NextOffset, "reason": stats.StopReason}
+	}
+	return marshalJSON(combined)
+}
 
-	for {
+type pageConsumer func(items []any) (scanned int, advance int, stop bool, err error)
+
+func (c *APIClient) iteratePages(ctx context.Context, op *Operation, args map[string]any, allPages bool, consume pageConsumer) (PageStats, error) {
+	offset := intArg(args["offset"], 0)
+	requestedPageSize := intArg(args["maxCount"], PageSize)
+	if requestedPageSize <= 0 || requestedPageSize > PageSize {
+		requestedPageSize = PageSize
+	}
+	stats := PageStats{NextOffset: offset}
+	seen := map[[32]byte]struct{}{}
+	listField := op.ListResponseField
+	complete := false
+	for stats.ScannedPages < c.maxPages && stats.ScannedItems < c.maxItems {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		pageSize := requestedPageSize
+		if remaining := c.maxItems - stats.ScannedItems; remaining < pageSize {
+			pageSize = remaining
+		}
 		pageArgs := cloneArgs(args)
-		pageArgs["maxCount"] = float64(PageSize)
+		pageArgs["maxCount"] = float64(pageSize)
 		pageArgs["offset"] = float64(offset)
 		delete(pageArgs, "all")
 		if op.Name == "inbox" {
@@ -135,33 +212,73 @@ func (c *APIClient) callAllPages(ctx context.Context, op *Operation, args map[st
 				pageArgs["includeAllRecurrenceInstances"] = false
 			}
 		}
-
 		raw, err := c.callOnce(ctx, op, pageArgs, nil)
 		if err != nil {
-			return nil, err
+			return stats, err
 		}
 		var page map[string]any
 		if err := json.Unmarshal(raw, &page); err != nil {
-			return nil, fmt.Errorf("decode paged response: %w", err)
+			return stats, fmt.Errorf("decode paged response: %w", err)
 		}
 		if listField == "" {
-			listField = op.ListResponseField
-			if listField == "" {
-				listField = firstArrayField(page)
-			}
+			listField = firstArrayField(page)
 		}
 		items, _ := page[listField].([]any)
-		if _, ok := combined[listField]; !ok {
-			combined[listField] = []any{}
+		if len(items) > pageSize {
+			items = items[:pageSize]
 		}
-		combined[listField] = append(combined[listField].([]any), items...)
-		if len(items) < PageSize {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		if len(items) > 0 {
+			canonical, _ := json.Marshal(items)
+			fingerprint := sha256.Sum256(canonical)
+			if _, ok := seen[fingerprint]; ok {
+				return stats, &ClientError{Code: "pagination_stalled", Message: "pagination stalled on a repeated page", Metadata: map[string]any{"offset": offset}}
+			}
+			seen[fingerprint] = struct{}{}
+		}
+		stats.ScannedPages++
+		scanned, advance, stop, err := consume(items)
+		if err != nil {
+			return stats, err
+		}
+		if scanned < 0 || scanned > len(items) {
+			return stats, fmt.Errorf("invalid page scanned count %d", scanned)
+		}
+		if advance < 0 || advance > scanned {
+			return stats, fmt.Errorf("invalid page advance count %d for %d scanned items", advance, scanned)
+		}
+		stats.ScannedItems += scanned
+		offset += advance
+		stats.NextOffset = offset
+		if stop {
+			stats.MorePossible, stats.StopReason = true, "consumer_limit"
 			break
 		}
-		offset += len(items)
+		if len(items) < pageSize {
+			complete = true
+			break
+		}
+		if !allPages {
+			stats.MorePossible, stats.StopReason = true, "single_page"
+			break
+		}
 	}
+	if !complete && !stats.MorePossible && stats.ScannedItems >= c.maxItems {
+		stats.StopReason, stats.MorePossible = "max_items", true
+	} else if !complete && !stats.MorePossible && stats.ScannedPages >= c.maxPages {
+		stats.StopReason, stats.MorePossible = "max_pages", true
+	}
+	return stats, nil
+}
 
-	return marshalJSON(combined)
+type PageStats struct {
+	ScannedPages int
+	ScannedItems int
+	NextOffset   int
+	MorePossible bool
+	StopReason   string
 }
 
 func postProcessListResponse(op *Operation, args map[string]any, raw []byte, today time.Time) ([]byte, error) {
@@ -213,6 +330,7 @@ func isTaskDateListOperation(name string) bool {
 func taskDateListArgs(operation string, args map[string]any, today time.Time) map[string]any {
 	out := cloneArgs(args)
 	delete(out, "all")
+	delete(out, "maxCount")
 	out["offset"] = float64(0)
 
 	switch operation {
@@ -423,45 +541,118 @@ func (c *APIClient) callOnce(ctx context.Context, op *Operation, args map[string
 	}
 	endpoint.RawQuery = query.Encode()
 
-	var body io.Reader
+	var bodyData []byte
 	if op.BodySchema != nil {
-		raw, err := json.Marshal(args["body"])
+		bodyData, err = json.Marshal(args["body"])
 		if err != nil {
 			return nil, fmt.Errorf("encode request body: %w", err)
 		}
-		body = bytes.NewReader(raw)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, op.Method, endpoint.String(), body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	if op.BodySchema != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var body io.Reader
+		if bodyData != nil {
+			body = bytes.NewReader(bodyData)
+		}
+		req, err := http.NewRequestWithContext(ctx, op.Method, endpoint.String(), body)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		if op.BodySchema != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("send %s %s: %w", op.Method, op.Path, err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("send %s %s: %w", op.Method, op.Path, err)
+		}
+		readLimit := c.maxResponseBytes
+		if readLimit < int64(1<<63-1) {
+			readLimit++
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read response: %w", readErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close response: %w", closeErr)
+		}
+		if int64(len(data)) > c.maxResponseBytes {
+			return nil, &ClientError{Code: "response_too_large", Message: "Singularity API response exceeds configured limit", Metadata: map[string]any{"limit": c.maxResponseBytes}}
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if resp.StatusCode == http.StatusNoContent || len(bytes.TrimSpace(data)) == 0 {
+				return []byte(`{"ok":true}`), nil
+			}
+			if !json.Valid(data) {
+				return nil, fmt.Errorf("invalid JSON response from %s %s", op.Method, op.Path)
+			}
+			return compactJSON(data), nil
+		}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		retriable := op.Method == http.MethodGet && transientStatus(resp.StatusCode)
+		retryAfter, hasRetryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), c.now())
+		if !retriable || attempt == maxAttempts {
+			apiErr := NewAPIError(resp.StatusCode, op.Method, op.Path, data, c.token)
+			if retriable {
+				apiErr.Retriable = true
+				apiErr.Attempts = attempt
+				if hasRetryAfter {
+					seconds := int(retryAfter / time.Second)
+					apiErr.RetryAfter = &seconds
+				}
+			}
+			return nil, apiErr
+		}
+		delay := retryAfter
+		if !hasRetryAfter {
+			delay = fallbackBackoff(attempt, op.Path)
+		}
+		if err := c.sleep(ctx, delay); err != nil {
+			return nil, err
+		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, NewAPIError(resp.StatusCode, op.Method, op.Path, data, c.token)
+	panic("unreachable")
+}
+
+func transientStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
-	if resp.StatusCode == http.StatusNoContent || len(bytes.TrimSpace(data)) == 0 {
-		return []byte(`{"ok":true}`), nil
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
 	}
-	if !json.Valid(data) {
-		return nil, fmt.Errorf("invalid JSON response from %s %s", op.Method, op.Path)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		const maxDurationSeconds = int64((1<<63 - 1) / int64(time.Second))
+		if seconds <= maxDurationSeconds {
+			return time.Duration(seconds) * time.Second, true
+		}
+		return 0, false
 	}
-	return compactJSON(data), nil
+	date, err := http.ParseTime(value)
+	if err != nil || date.Before(now) {
+		return 0, false
+	}
+	return date.Sub(now), true
+}
+
+func fallbackBackoff(attempt int, path string) time.Duration {
+	base := 200 * time.Millisecond * time.Duration(1<<(attempt-1))
+	// Path/attempt-derived jitter is bounded and deterministic, avoiding both
+	// synchronized clients and flaky tests.
+	hash := sha256.Sum256([]byte(path + strconv.Itoa(attempt)))
+	delay := base + time.Duration(hash[0]%21)*base/100
+	return min(delay, 2*time.Second)
 }
 
 func (c *APIClient) endpoint(op *Operation, args map[string]any) (*url.URL, error) {
@@ -534,17 +725,29 @@ func hasAnyQueryFilter(op *Operation, args map[string]any) bool {
 }
 
 func StructuredError(err error) string {
+	var clientErr *ClientError
+	if errors.As(err, &clientErr) {
+		payload := map[string]any{"type": clientErr.Code, "message": clientErr.Message}
+		maps.Copy(payload, clientErr.Metadata)
+		return string(mustJSON(map[string]any{"error": payload}))
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return string(mustJSON(map[string]any{
-			"error": map[string]any{
-				"type":     "api_error",
-				"status":   apiErr.Status,
-				"method":   apiErr.Method,
-				"path":     apiErr.Path,
-				"response": apiErr.Response,
-			},
-		}))
+		payload := map[string]any{
+			"type":    "api_error",
+			"status":  apiErr.Status,
+			"method":  apiErr.Method,
+			"path":    apiErr.Path,
+			"message": "Singularity API request failed",
+		}
+		if apiErr.Retriable {
+			payload["retriable"] = true
+			payload["attempts"] = apiErr.Attempts
+			if apiErr.RetryAfter != nil {
+				payload["retryAfter"] = *apiErr.RetryAfter
+			}
+		}
+		return string(mustJSON(map[string]any{"error": payload}))
 	}
 	var validationErr *ValidationError
 	if errors.As(err, &validationErr) {

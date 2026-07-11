@@ -22,6 +22,7 @@ type Builder struct {
 	Server               *server.MCPServer
 	RequireWriteApproval bool
 	ApprovalTimeout      time.Duration
+	OperationTimeout     time.Duration
 	// approvalRequestSlots bounds a transport or handler that ignores context
 	// cancellation to one orphaned elicitation request at a time.
 	approvalRequestSlots chan struct{}
@@ -31,9 +32,13 @@ type Builder struct {
 type Options struct {
 	RequireWriteApproval bool
 	ApprovalTimeout      time.Duration
+	OperationTimeout     time.Duration
 }
 
-const defaultApprovalTimeout = 2 * time.Minute
+const (
+	defaultApprovalTimeout  = 2 * time.Minute
+	defaultOperationTimeout = 2 * time.Minute
+)
 
 func NewServer(client *singularity.APIClient, catalog *singularity.Catalog, version string) *server.MCPServer {
 	return NewServerWithOptions(client, catalog, version, Options{RequireWriteApproval: true})
@@ -61,6 +66,7 @@ func NewServerWithOptions(client *singularity.APIClient, catalog *singularity.Ca
 		Server:               mcpServer,
 		RequireWriteApproval: options.RequireWriteApproval,
 		ApprovalTimeout:      approvalTimeoutOrDefault(options.ApprovalTimeout),
+		OperationTimeout:     operationTimeoutOrDefault(options.OperationTimeout),
 		approvalRequestSlots: make(chan struct{}, 1),
 	}
 	builder.Register(mcpServer)
@@ -110,7 +116,14 @@ func (b Builder) handleTool(ctx context.Context, group *singularity.ToolGroup, r
 	if approvalResult, proceed := b.requireWriteApproval(ctx, group.ToolName, op, prepared.Args); !proceed {
 		return approvalResult, nil
 	}
-	raw, err := b.Client.ExecutePrepared(ctx, prepared)
+	operationCtx, cancel := context.WithTimeout(ctx, operationTimeoutOrDefault(b.OperationTimeout))
+	raw, err := b.Client.ExecutePrepared(operationCtx, prepared)
+	operationErr := operationCtx.Err()
+	cancel()
+	if errors.Is(operationErr, context.DeadlineExceeded) {
+		timeout := operationTimeoutOrDefault(b.OperationTimeout)
+		err = &singularity.ClientError{Code: "operation_timeout", Message: "Singularity API operation timed out", Metadata: map[string]any{"timeoutMs": timeout.Milliseconds()}}
+	}
 	if err != nil {
 		return mcp.NewToolResultError(singularity.StructuredError(err)), nil
 	}
@@ -220,6 +233,13 @@ func (b Builder) requestElicitation(ctx context.Context, mcpServer *server.MCPSe
 func approvalTimeoutOrDefault(value time.Duration) time.Duration {
 	if value == 0 {
 		return defaultApprovalTimeout
+	}
+	return value
+}
+
+func operationTimeoutOrDefault(value time.Duration) time.Duration {
+	if value == 0 {
+		return defaultOperationTimeout
 	}
 	return value
 }

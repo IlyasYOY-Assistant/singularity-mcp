@@ -147,6 +147,16 @@ func TestBinaryStdioSmoke(t *testing.T) {
 	if len(tools) != 8 {
 		t.Fatalf("tools = %d, resp = %#v", len(tools), resp)
 	}
+	operationCount := 0
+	for _, rawTool := range tools {
+		tool := rawTool.(map[string]any)
+		schema := tool["inputSchema"].(map[string]any)
+		variants, _ := schema["oneOf"].([]any)
+		operationCount += len(variants)
+	}
+	if operationCount != 48 {
+		t.Fatalf("operations = %d", operationCount)
+	}
 	for _, rawTool := range tools {
 		tool := rawTool.(map[string]any)
 		schema := tool["inputSchema"].(map[string]any)
@@ -186,6 +196,109 @@ func TestBinaryStdioSmoke(t *testing.T) {
 	stdin.Close()
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("wait: %v, stderr: %s", err, stderr.String())
+	}
+}
+
+func TestBinaryStdioBoundedSearchAndStableErrors(t *testing.T) {
+	var projectCalls int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/project":
+			projectCalls++
+			_, _ = w.Write([]byte(`{"projects":[{"id":"P-1","title":"match"},{"id":"P-2","title":"match"}]}`))
+		case "/v2/tag":
+			_, _ = w.Write([]byte(`{"tags":[]}` + strings.Repeat(" ", 300)))
+		case "/v2/habit":
+			<-r.Context().Done()
+		default:
+			t.Errorf("unexpected API path %s", r.URL.Path)
+		}
+	}))
+	defer api.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "run", ".", "-token", "fake-token", "-base-url", api.URL,
+		"-max-response-bytes", "256", "-operation-timeout", "30ms")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	enc := json.NewEncoder(stdin)
+	dec := json.NewDecoder(bufio.NewReader(stdout))
+	send := func(value any) {
+		t.Helper()
+		if err := enc.Encode(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(id int) map[string]any {
+		t.Helper()
+		for {
+			var msg map[string]any
+			if err := dec.Decode(&msg); err != nil {
+				t.Fatalf("read: %v stderr=%s", err, stderr.String())
+			}
+			if got, ok := msg["id"].(float64); ok && int(got) == id {
+				return msg
+			}
+		}
+	}
+	send(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": mcp.LATEST_PROTOCOL_VERSION, "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "phase-c", "version": "1"},
+	}})
+	if response := read(1); response["error"] != nil {
+		t.Fatalf("initialize=%v", response)
+	}
+	send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}})
+	call := func(id int, name string, args map[string]any) map[string]any {
+		t.Helper()
+		send(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": map[string]any{"name": name, "arguments": args}})
+		response := read(id)
+		result, _ := response["result"].(map[string]any)
+		return result
+	}
+
+	search := call(2, "singularity_projects", map[string]any{"operation": "search", "query": "match", "all": false, "limit": 1})
+	if isError, _ := search["isError"].(bool); isError {
+		t.Fatalf("search=%v", search)
+	}
+	structured := search["structuredContent"].(map[string]any)
+	pagination := structured["pagination"].(map[string]any)
+	if structured["count"] != float64(1) || pagination["morePagesPossible"] != true || projectCalls != 1 {
+		t.Fatalf("bounded search=%v calls=%d", structured, projectCalls)
+	}
+
+	resultText := func(result map[string]any) string {
+		contents, _ := result["content"].([]any)
+		if len(contents) == 0 {
+			return ""
+		}
+		content, _ := contents[0].(map[string]any)
+		text, _ := content["text"].(string)
+		return text
+	}
+	oversized := call(3, "singularity_tags", map[string]any{"operation": "list"})
+	if oversized["isError"] != true || !strings.Contains(resultText(oversized), `"type":"response_too_large"`) {
+		t.Fatalf("oversized=%v", oversized)
+	}
+	timedOut := call(4, "singularity_habits", map[string]any{"operation": "list"})
+	if timedOut["isError"] != true || !strings.Contains(resultText(timedOut), `"type":"operation_timeout"`) {
+		t.Fatalf("timeout=%v", timedOut)
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("wait: %v stderr=%s", err, stderr.String())
 	}
 }
 
