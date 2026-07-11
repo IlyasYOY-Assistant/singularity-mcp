@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,17 @@ func TestBinaryStdioSmoke(t *testing.T) {
 	if len(tools) != 8 {
 		t.Fatalf("tools = %d, resp = %#v", len(tools), resp)
 	}
+	for _, rawTool := range tools {
+		tool := rawTool.(map[string]any)
+		schema := tool["inputSchema"].(map[string]any)
+		raw, _ := json.Marshal(schema)
+		if strings.Contains(string(raw), `"$ref"`) {
+			t.Fatalf("tool %v has unresolved ref: %s", tool["name"], raw)
+		}
+		if variants, _ := schema["oneOf"].([]any); len(variants) == 0 {
+			t.Fatalf("tool %v has no operation variants: %s", tool["name"], raw)
+		}
+	}
 
 	send(map[string]any{
 		"jsonrpc": "2.0",
@@ -166,6 +178,9 @@ func TestBinaryStdioSmoke(t *testing.T) {
 	result, _ = resp["result"].(map[string]any)
 	if isError, _ := result["isError"].(bool); isError {
 		t.Fatalf("tool error: %#v", result)
+	}
+	if !reflect.DeepEqual(result["structuredContent"], map[string]any{"projects": []any{}}) {
+		t.Fatalf("structured content: %#v", result["structuredContent"])
 	}
 
 	stdin.Close()

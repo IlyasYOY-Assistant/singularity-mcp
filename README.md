@@ -59,7 +59,10 @@ environments where write prompts are intentionally disabled.
 
 ## Tools
 
-The server exposes 8 merged tools with an `operation` enum:
+The server exposes 8 stable merged tools. Each tool publishes a strict root
+`oneOf` schema with one variant per operation, so only fields relevant to the
+selected operation are accepted. The MCP server validates these schemas before
+the handler or Singularity API is reached:
 
 - `singularity_projects`: `list`, `search`, `get`, `create`, `update`, `delete`
 - `singularity_task_groups`: `list`, `get`, `create`, `update`, `delete`
@@ -71,6 +74,14 @@ The server exposes 8 merged tools with an `operation` enum:
 - `singularity_time_stats`: `list`, `get`, `create`, `update`, `delete`, `delete_bulk`
 
 Kanban operations are intentionally omitted.
+
+Write calls are normalized and semantically validated before approval is
+requested. The approval preview therefore contains the same normalized payload
+that is sent to Singularity. Successful calls return machine-readable structured
+JSON while retaining the JSON text content fallback for older MCP clients.
+
+Discovery resources remain available at `singularity://capabilities` and
+`singularity://openapi`.
 
 Task date helpers are computed in the MCP client layer:
 

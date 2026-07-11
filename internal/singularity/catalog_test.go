@@ -1,6 +1,8 @@
 package singularity
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/IlyasYOY/singularity-mcp/openapi"
@@ -80,6 +82,64 @@ func TestCatalogOperationDetails(t *testing.T) {
 	for i := range want {
 		if create.BodyRequired[i] != want[i] {
 			t.Fatalf("required = %v", create.BodyRequired)
+		}
+	}
+}
+
+func TestResolveSchemaRecursivelyAndRejectsCycles(t *testing.T) {
+	doc := openAPIDoc{}
+	doc.Components.Schemas = map[string]map[string]any{
+		"Outer": {"type": "object", "properties": map[string]any{"inner": map[string]any{"$ref": "#/components/schemas/Inner"}}},
+		"Inner": {"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}},
+	}
+	resolved, err := resolveSchemaDeep(doc, map[string]any{"$ref": "#/components/schemas/Outer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(resolved)
+	if strings.Contains(string(raw), `"$ref"`) || !strings.Contains(string(raw), `"value"`) {
+		t.Fatalf("resolved = %s", raw)
+	}
+
+	doc.Components.Schemas["Inner"] = map[string]any{"$ref": "#/components/schemas/Outer"}
+	if _, err := resolveSchemaDeep(doc, map[string]any{"$ref": "#/components/schemas/Outer"}); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cycle error = %v", err)
+	}
+}
+
+func TestResolveSchemaRejectsUnknownRefsAndPreservesSiblings(t *testing.T) {
+	doc := openAPIDoc{}
+	doc.Components.Schemas = map[string]map[string]any{
+		"Known": {"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}},
+	}
+	if _, err := resolveSchemaDeep(doc, map[string]any{"$ref": "#/components/schemas/Missing"}); err == nil || !strings.Contains(err.Error(), "unknown schema ref") {
+		t.Fatalf("unknown-ref error = %v", err)
+	}
+	resolved, err := resolveSchemaDeep(doc, map[string]any{
+		"$ref":        "#/components/schemas/Known",
+		"description": "call-site description",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved["description"] != "call-site description" || resolved["properties"] == nil {
+		t.Fatalf("resolved siblings = %v", resolved)
+	}
+}
+
+func TestCatalogProjectBodiesContainNoRefs(t *testing.T) {
+	catalog, err := NewCatalog(openapi.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"create", "update"} {
+		op, _ := catalog.Operation("singularity_projects", name)
+		raw, _ := json.Marshal(op.BodySchema)
+		if strings.Contains(string(raw), `"$ref"`) {
+			t.Fatalf("%s body has ref: %s", name, raw)
+		}
+		if !strings.Contains(string(raw), "reviewValidationInterval") {
+			t.Fatalf("%s body missing interval: %s", name, raw)
 		}
 	}
 }
