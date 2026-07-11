@@ -22,6 +22,14 @@ func TestUsageIncludesFlagsAndDefaults(t *testing.T) {
 		"-approval-timeout duration",
 		"SINGULARITY_MCP_APPROVAL_TIMEOUT",
 		"2m0s",
+		"-operation-timeout duration",
+		"SINGULARITY_MCP_OPERATION_TIMEOUT",
+		"-max-pages int",
+		"SINGULARITY_MCP_MAX_PAGES",
+		"-max-items int",
+		"SINGULARITY_MCP_MAX_ITEMS",
+		"-max-response-bytes int",
+		"SINGULARITY_MCP_MAX_RESPONSE_BYTES",
 		"-require-write-approval",
 		"-version",
 		"-help, -h",
@@ -36,6 +44,7 @@ func TestToolOptionsIncludesApprovalTimeout(t *testing.T) {
 	cfg := config.Config{
 		RequireWriteApproval: true,
 		ApprovalTimeout:      17 * time.Second,
+		OperationTimeout:     23 * time.Second,
 	}
 
 	got := toolOptions(cfg)
@@ -45,5 +54,8 @@ func TestToolOptionsIncludesApprovalTimeout(t *testing.T) {
 	}
 	if got.ApprovalTimeout != 17*time.Second {
 		t.Fatalf("ApprovalTimeout = %s", got.ApprovalTimeout)
+	}
+	if got.OperationTimeout != 23*time.Second {
+		t.Fatalf("OperationTimeout = %s", got.OperationTimeout)
 	}
 }

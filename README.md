@@ -36,8 +36,12 @@ Config precedence is CLI flag, then environment, then default:
 
 - `-token` / `SINGULARITY_TOKEN` required for API calls
 - `-base-url` / `SINGULARITY_BASE_URL`, default `https://api.singularity-app.com`
-- `-timeout` / `SINGULARITY_TIMEOUT`, default `30s`
+- `-timeout` / `SINGULARITY_TIMEOUT`, default `30s` (each HTTP request)
 - `-approval-timeout` / `SINGULARITY_MCP_APPROVAL_TIMEOUT`, default `2m`
+- `-operation-timeout` / `SINGULARITY_MCP_OPERATION_TIMEOUT`, default `2m`
+- `-max-pages` / `SINGULARITY_MCP_MAX_PAGES`, default `100`
+- `-max-items` / `SINGULARITY_MCP_MAX_ITEMS`, default `10000`
+- `-max-response-bytes` / `SINGULARITY_MCP_MAX_RESPONSE_BYTES`, default `1048576` (1 MiB)
 - `-require-write-approval` / `SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL`, default `true`
 - `-version` prints the CLI version and exits
 - `-help` / `-h` prints CLI usage and exits
@@ -49,10 +53,16 @@ made. Read-only operations are `list`, `get`, `inbox`, `overdue`, `today`, and
 `delete_bulk`, require approval.
 Approval requests time out after two minutes by default. A timeout fails closed,
 so the write is blocked without calling the Singularity API. Late approval responses
-are ignored, including responses from handlers that do not honor cancellation. The
-approval timeout applies only to the MCP elicitation wait; API calls continue to use
-`-timeout`. As with all stdio MCP traffic, the client must continue draining server
-stdout for timeout results and other protocol messages to be delivered.
+are ignored, including responses from handlers that do not honor cancellation.
+Three distinct timeout boundaries apply:
+
+- the request timeout (`-timeout`) bounds each individual HTTP attempt;
+- the operation timeout (`-operation-timeout`) bounds the complete API execution,
+  including pagination and retry waits, and starts only after write approval;
+- the approval timeout (`-approval-timeout`) bounds only the MCP elicitation wait.
+
+As with all stdio MCP traffic, the client must continue draining server stdout for
+timeout results and other protocol messages to be delivered.
 Set `-require-write-approval=false` or
 `SINGULARITY_MCP_REQUIRE_WRITE_APPROVAL=false` only for trusted clients or
 environments where write prompts are intentionally disabled.
@@ -90,9 +100,38 @@ Task date helpers are computed in the MCP client layer:
 - `only-today`: active tasks with `start` today only
 
 Search helpers are computed in the MCP client layer for tasks, projects, and
-tags. They fetch list pages from the Singularity API, filter locally, and
-return compact bounded results by default. Search uses case-insensitive
-substring matching over `title` unless `fields` is provided.
+tags. They fetch and filter one page at a time, stopping as soon as `limit+1`
+matches establish truncation. Search uses case-insensitive substring matching
+over `title` unless `fields` is provided. `all=false` examines exactly one API
+page; the default `all=true` remains bounded by the configured page, item,
+response-size, and operation-time limits. It is not an unlimited export mode.
+
+Bounded list/search results include additive continuation metadata when more data
+may exist. For example:
+
+```json
+{
+  "pagination": {
+    "scannedPages": 2,
+    "scannedItems": 1375,
+    "truncated": true,
+    "morePagesPossible": true,
+    "nextOffset": 1375,
+    "reason": "max_items"
+  }
+}
+```
+
+`nextOffset` identifies the first unconsumed entity. Clients may continue from
+that offset, but each continuation is independently bounded. Repeated non-empty
+pages fail with `pagination_stalled`, and oversized responses fail with
+`response_too_large` rather than being reported as malformed JSON.
+
+GET requests retry only HTTP 429, 502, 503, and 504 responses, with at most three
+total attempts. A valid integer-seconds or HTTP-date `Retry-After` value is
+honored; otherwise bounded exponential backoff with deterministic jitter is used.
+Cancellation interrupts retry waiting. POST, PATCH, and DELETE requests are never
+retried, so an approved write is attempted once.
 
 Examples:
 
@@ -104,8 +143,9 @@ Examples:
 {"operation":"search","projectId":"P-...","tag":"TG-...","query":"review"}
 ```
 
-By default, search fetches all pages with `maxCount=1000`; pass `all=false` to
-search only the first API page.
+By default, search traverses pages with `maxCount=1000` until it finds enough
+matches, reaches the upstream end, or hits a configured bound; pass `all=false`
+to inspect only the first API page.
 
 ## Generate And Test
 

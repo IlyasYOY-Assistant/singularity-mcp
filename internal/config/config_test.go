@@ -303,3 +303,73 @@ func TestParseRejectsBadInputs(t *testing.T) {
 		})
 	}
 }
+
+func TestParseRuntimeLimits(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		got, err := Parse(nil, func(string) string { return "" })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Config.OperationTimeout != 2*time.Minute || got.Config.MaxPages != 100 || got.Config.MaxItems != 10000 || got.Config.MaxResponseBytes != 1048576 {
+			t.Fatalf("limits = %#v", got.Config)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		env := map[string]string{"SINGULARITY_MCP_OPERATION_TIMEOUT": "45s", "SINGULARITY_MCP_MAX_PAGES": "7", "SINGULARITY_MCP_MAX_ITEMS": "88", "SINGULARITY_MCP_MAX_RESPONSE_BYTES": "999"}
+		got, err := Parse(nil, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Config.OperationTimeout != 45*time.Second || got.Config.MaxPages != 7 || got.Config.MaxItems != 88 || got.Config.MaxResponseBytes != 999 {
+			t.Fatalf("limits = %#v", got.Config)
+		}
+	})
+	t.Run("CLI overrides malformed environment", func(t *testing.T) {
+		env := map[string]string{"SINGULARITY_MCP_OPERATION_TIMEOUT": "bad", "SINGULARITY_MCP_MAX_PAGES": "bad", "SINGULARITY_MCP_MAX_ITEMS": "bad", "SINGULARITY_MCP_MAX_RESPONSE_BYTES": "bad"}
+		got, err := Parse([]string{"--operation-timeout=3s", "--max-pages=2", "--max-items=3", "--max-response-bytes=4"}, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Config.OperationTimeout != 3*time.Second || got.Config.MaxPages != 2 || got.Config.MaxItems != 3 || got.Config.MaxResponseBytes != 4 {
+			t.Fatalf("limits = %#v", got.Config)
+		}
+	})
+}
+
+func TestParseRuntimeLimitsRejectInvalid(t *testing.T) {
+	for _, tc := range []struct{ name, key, value string }{
+		{"operation malformed", "SINGULARITY_MCP_OPERATION_TIMEOUT", "bad"}, {"operation zero", "SINGULARITY_MCP_OPERATION_TIMEOUT", "0s"},
+		{"pages malformed", "SINGULARITY_MCP_MAX_PAGES", "bad"}, {"pages negative", "SINGULARITY_MCP_MAX_PAGES", "-1"},
+		{"items zero", "SINGULARITY_MCP_MAX_ITEMS", "0"}, {"bytes negative", "SINGULARITY_MCP_MAX_RESPONSE_BYTES", "-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Parse(nil, func(k string) string {
+				if k == tc.key {
+					return tc.value
+				}
+				return ""
+			}); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestParseRuntimeLimitsMalformedEnvBypassedForHelpAndVersion(t *testing.T) {
+	for _, arg := range []string{"-help", "--help", "-h", "--h", "-version", "--version"} {
+		t.Run(arg, func(t *testing.T) {
+			got, err := Parse([]string{arg}, func(k string) string {
+				if strings.HasPrefix(k, "SINGULARITY_MCP_") {
+					return "bad"
+				}
+				return ""
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.HelpOnly && !got.VersionOnly {
+				t.Fatalf("result=%#v", got)
+			}
+		})
+	}
+}
