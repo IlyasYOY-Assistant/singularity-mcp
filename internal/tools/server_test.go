@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,159 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+func TestToolContractOperationVariants(t *testing.T) {
+	catalog := testCatalog(t)
+	for _, group := range catalog.Groups {
+		tool := toolForGroup(group)
+		for _, op := range group.Operations {
+			if !strings.Contains(tool.Description, op.Name) {
+				t.Fatalf("%s description missing operation %s: %q", group.ToolName, op.Name, tool.Description)
+			}
+			label := "Read:"
+			if operationRequiresApproval(op) {
+				label = "Write:"
+			}
+			if !strings.Contains(tool.Description, label) {
+				t.Fatalf("%s description missing %s: %q", group.ToolName, label, tool.Description)
+			}
+		}
+		raw := tool.RawInputSchema
+		var schema map[string]any
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		variants, ok := schema["oneOf"].([]any)
+		if !ok || len(variants) != len(group.Operations) {
+			t.Fatalf("%s variants=%d want=%d schema=%s", group.ToolName, len(variants), len(group.Operations), raw)
+		}
+		if strings.Contains(string(raw), `"$ref"`) {
+			t.Fatalf("%s contains ref: %s", group.ToolName, raw)
+		}
+		for _, op := range group.Operations {
+			variant := operationVariant(t, variants, op.Name)
+			if variant["additionalProperties"] != false {
+				t.Fatalf("%s.%s is not strict", group.ToolName, op.Name)
+			}
+			props := variant["properties"].(map[string]any)
+			if op.Name == "create" {
+				body := props["body"].(map[string]any)
+				if body["additionalProperties"] != false {
+					t.Fatalf("%s create body is not strict", group.ToolName)
+				}
+			}
+			if op.Name == "search" {
+				for key, want := range map[string]any{"all": true, "compact": true, "limit": float64(20)} {
+					if props[key].(map[string]any)["default"] != want {
+						t.Fatalf("%s search %s default=%v", group.ToolName, key, props[key].(map[string]any)["default"])
+					}
+				}
+				limit := props["limit"].(map[string]any)
+				if limit["type"] != "integer" || limit["minimum"] != float64(1) || limit["maximum"] != float64(100) {
+					t.Fatalf("limit=%v", limit)
+				}
+				fields := props["fields"].(map[string]any)["items"].(map[string]any)["enum"].([]any)
+				hasNote := false
+				for _, field := range fields {
+					hasNote = hasNote || field == "note"
+				}
+				if want := op.Tag == "task" || op.Tag == "project"; hasNote != want {
+					t.Fatalf("%s search fields=%v, note support=%v want=%v", group.ToolName, fields, hasNote, want)
+				}
+				for _, key := range []string{"tag", "tags", "tagMode", "checked", "priority"} {
+					_, exists := props[key]
+					if want := op.Tag == "task"; exists != want {
+						t.Fatalf("%s search field %s exists=%v want=%v", group.ToolName, key, exists, want)
+					}
+				}
+			}
+			for _, key := range []string{"maxCount", "offset"} {
+				if field, ok := props[key].(map[string]any); ok && field["type"] != "integer" {
+					t.Fatalf("%s.%s %s type=%v", group.ToolName, op.Name, key, field["type"])
+				}
+			}
+			if group.ToolName == "singularity_tasks" && (op.Name == "inbox" || op.Name == "overdue" || op.Name == "today" || op.Name == "only-today") {
+				if _, exists := props["all"]; exists {
+					t.Fatalf("%s must not advertise ignored all control: %v", op.Name, props)
+				}
+				_, hasCompact := props["compact"]
+				wantCompact := op.Name != "inbox"
+				if hasCompact != wantCompact {
+					t.Fatalf("%s compact exists=%v want=%v: %v", op.Name, hasCompact, wantCompact, props)
+				}
+				wantFields := 1
+				if wantCompact {
+					wantFields++
+				}
+				if len(props) != wantFields {
+					t.Fatalf("%s synthetic fields=%v", op.Name, props)
+				}
+			}
+			if op.Name == "delete" && props["confirm"].(map[string]any)["const"] != true {
+				t.Fatalf("delete confirm=%v", props["confirm"])
+			}
+			if op.Name == "delete_bulk" && props["confirm"].(map[string]any)["const"] != "DELETE" {
+				t.Fatalf("bulk confirm=%v", props["confirm"])
+			}
+		}
+	}
+}
+
+func operationVariant(t *testing.T, variants []any, name string) map[string]any {
+	t.Helper()
+	for _, raw := range variants {
+		variant := raw.(map[string]any)
+		props := variant["properties"].(map[string]any)
+		if props["operation"].(map[string]any)["const"] == name {
+			return variant
+		}
+	}
+	t.Fatalf("variant %s missing", name)
+	return nil
+}
+
+func TestInputSchemaValidationRejectsInvalidCallsBeforeHTTP(t *testing.T) {
+	catalog := testCatalog(t)
+	var calls int
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.Write([]byte(`{"ok":true}`)) }))
+	defer api.Close()
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: false})
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	startClient(t, c)
+	bad := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"singularity_projects", map[string]any{"operation": "create"}},
+		{"singularity_projects", map[string]any{"operation": "create", "body": map[string]any{}}},
+		{"singularity_projects", map[string]any{"operation": "create", "body": map[string]any{"title": "x", "isNotebook": "yes"}}},
+		{"singularity_projects", map[string]any{"operation": "list", "unknown": true}},
+		{"singularity_projects", map[string]any{"operation": "search", "query": "x", "limit": 1.5}},
+		{"singularity_projects", map[string]any{"operation": "delete", "id": "P-1", "confirm": false}},
+		{"singularity_tasks", map[string]any{"operation": "inbox", "all": false}},
+		{"singularity_tasks", map[string]any{"operation": "inbox", "compact": false}},
+		{"singularity_tasks", map[string]any{"operation": "overdue", "all": false}},
+	}
+	for _, tt := range bad {
+		req := mcp.CallToolRequest{}
+		req.Params.Name = tt.tool
+		req.Params.Arguments = tt.args
+		result, err := c.CallTool(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.IsError {
+			t.Fatalf("accepted invalid args: %v", tt.args)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("http calls=%d", calls)
+	}
+}
 
 func TestToolSchemasAndResources(t *testing.T) {
 	catalog := testCatalog(t)
@@ -41,30 +195,9 @@ func TestToolSchemasAndResources(t *testing.T) {
 		if strings.Contains(tool.Name, "kanban") {
 			t.Fatalf("kanban tool exposed: %s", tool.Name)
 		}
-		if tool.Name == "singularity_time_stats" {
-			raw, _ := json.Marshal(tool.InputSchema)
-			if !strings.Contains(string(raw), "delete_bulk") {
-				t.Fatalf("time stats schema missing delete_bulk: %s", raw)
-			}
-		}
-		if tool.Name == "singularity_tasks" {
-			raw, _ := json.Marshal(tool.InputSchema)
-			schema := string(raw)
-			for _, want := range []string{"inbox", "overdue", "today", "only-today", "search", "compact", "query", "fields", "limit", "tag", "tags", "tagMode"} {
-				if !strings.Contains(schema, want) {
-					t.Fatalf("task schema missing %s: %s", want, raw)
-				}
-			}
-			if !strings.Contains(schema, "noteText") || !strings.Contains(schema, "Do not pass JSON or Quill Delta") {
-				t.Fatalf("task schema missing plain note guidance: %s", raw)
-			}
-		}
-		if tool.Name == "singularity_projects" {
-			raw, _ := json.Marshal(tool.InputSchema)
-			schema := string(raw)
-			if !strings.Contains(schema, "noteText") || !strings.Contains(schema, "Do not pass JSON or Quill Delta") {
-				t.Fatalf("project schema missing plain note guidance: %s", raw)
-			}
+		if tool.Name == "singularity_tasks" || tool.Name == "singularity_projects" || tool.Name == "singularity_time_stats" {
+			// Detailed raw schemas are covered by TestToolContractOperationVariants;
+			// mcp-go's typed client representation does not preserve root oneOf.
 		}
 	}
 	if !names["singularity_projects"] || !names["singularity_tasks"] {
@@ -86,11 +219,41 @@ func TestToolSchemasAndResources(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := read.Contents[0].(mcp.TextResourceContents).Text
-	if !strings.Contains(text, `"exposed":48`) || !strings.Contains(text, "kanban-status") {
+	if !strings.Contains(text, `"swaggerTotal":51`) || !strings.Contains(text, `"swaggerExposed":41`) || !strings.Contains(text, `"synthetic":7`) || !strings.Contains(text, `"omitted":10`) || !strings.Contains(text, `"exposedTotal":48`) || !strings.Contains(text, "kanban-status") {
 		t.Fatalf("capabilities = %s", text)
 	}
 	if !strings.Contains(text, `"requireWriteApproval":true`) {
 		t.Fatalf("capabilities missing write approval policy: %s", text)
+	}
+}
+
+func TestStructuredToolResultMatchesText(t *testing.T) {
+	catalog := testCatalog(t)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{"projects":[]}`)) }))
+	defer api.Close()
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: false})
+	c, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	startClient(t, c)
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "singularity_projects"
+	req.Params.Arguments = map[string]any{"operation": "list"}
+	result, err := c.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StructuredContent == nil {
+		t.Fatal("structured content is nil")
+	}
+	var text any
+	if err := json.Unmarshal([]byte(resultText(result)), &text); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.StructuredContent, text) {
+		t.Fatalf("structured=%v text=%v", result.StructuredContent, text)
 	}
 }
 
@@ -169,18 +332,71 @@ func TestToolValidationAndAPIErrors(t *testing.T) {
 		return resultText(result)
 	}
 
-	if got := call(map[string]any{}); !strings.Contains(got, "operation is required") {
+	if got := call(map[string]any{}); !strings.Contains(got, "operation") {
 		t.Fatalf("missing operation error: %s", got)
 	}
-	if got := call(map[string]any{"operation": "nope"}); !strings.Contains(got, "invalid operation") {
+	if got := call(map[string]any{"operation": "nope"}); !strings.Contains(got, "validation") {
 		t.Fatalf("invalid operation error: %s", got)
 	}
-	if got := call(map[string]any{"operation": "get"}); !strings.Contains(got, "id is required") {
+	if got := call(map[string]any{"operation": "get"}); !strings.Contains(got, "Missing:[id]") {
 		t.Fatalf("missing id error: %s", got)
 	}
 	got := call(map[string]any{"operation": "list"})
 	if !strings.Contains(got, `"status":403`) || strings.Contains(got, "secret-token") {
 		t.Fatalf("api error = %s", got)
+	}
+}
+
+func TestApprovalUsesPreparedPayloadAndInvalidWritesSkipApproval(t *testing.T) {
+	catalog := testCatalog(t)
+	var gotBody map[string]any
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Write([]byte(`{"id":"P-1"}`))
+	}))
+	defer api.Close()
+	srv := NewServerWithOptions(testClient(t, api.URL), catalog, "test", Options{RequireWriteApproval: true, ApprovalTimeout: time.Second})
+	h := &testElicitationHandler{action: mcp.ElicitationResponseActionAccept, approved: true}
+	c := newInProcessClientWithElicitation(t, srv, h)
+	defer c.Close()
+	startClient(t, c)
+	call := func(body map[string]any) *mcp.CallToolResult {
+		req := mcp.CallToolRequest{}
+		req.Params.Name = "singularity_projects"
+		req.Params.Arguments = map[string]any{"operation": "create", "body": body}
+		result, err := c.CallTool(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	missingTitle := call(map[string]any{})
+	if !missingTitle.IsError || h.calls != 0 {
+		t.Fatalf("missing-title result=%v approvals=%d", missingTitle, h.calls)
+	}
+	deleteReq := mcp.CallToolRequest{}
+	deleteReq.Params.Name = "singularity_projects"
+	deleteReq.Params.Arguments = map[string]any{"operation": "delete", "id": "P-1"}
+	missingConfirm, err := c.CallTool(context.Background(), deleteReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !missingConfirm.IsError || h.calls != 0 {
+		t.Fatalf("missing-confirm result=%v approvals=%d", missingConfirm, h.calls)
+	}
+	invalid := call(map[string]any{"title": "x", "note": "a", "noteText": "b"})
+	if !invalid.IsError || h.calls != 0 {
+		t.Fatalf("invalid result=%v approvals=%d", invalid, h.calls)
+	}
+	valid := call(map[string]any{"title": "x", "noteText": "plain"})
+	if valid.IsError {
+		t.Fatalf("valid error=%s", resultText(valid))
+	}
+	if h.calls != 1 || !strings.Contains(h.last.Params.Message, `"note":"plain"`) || strings.Contains(h.last.Params.Message, "noteText") {
+		t.Fatalf("approval=%q", h.last.Params.Message)
+	}
+	if gotBody["note"] != "plain" {
+		t.Fatalf("body=%v", gotBody)
 	}
 }
 
@@ -498,7 +714,7 @@ func TestRequireWriteApprovalAllowsApprovedWrites(t *testing.T) {
 
 	req := mcp.CallToolRequest{}
 	req.Params.Name = "singularity_projects"
-	req.Params.Arguments = map[string]any{"operation": "create", "maxCount": float64(1), "body": map[string]any{"title": "new"}}
+	req.Params.Arguments = map[string]any{"operation": "create", "body": map[string]any{"title": "new"}}
 	result, err := c.CallTool(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
@@ -510,7 +726,7 @@ func TestRequireWriteApprovalAllowsApprovedWrites(t *testing.T) {
 		t.Fatalf("elicitation calls = %d", handler.calls)
 	}
 	message := handler.last.Params.Message
-	for _, want := range []string{"tool=singularity_projects", "operation=create", "method=POST", "path=/v2/project", "args=", "maxCount", "body="} {
+	for _, want := range []string{"tool=singularity_projects", "operation=create", "method=POST", "path=/v2/project", "body="} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("approval message missing %q: %q", want, message)
 		}

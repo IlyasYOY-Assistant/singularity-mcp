@@ -336,13 +336,9 @@ func requestBodySchema(doc openAPIDoc, body *requestBodyDoc) (map[string]any, []
 	if !ok {
 		return nil, nil, fmt.Errorf("missing application/json content")
 	}
-	schema := cloneMap(jsonContent.Schema)
-	if ref, _ := schema["$ref"].(string); ref != "" {
-		resolved, ok := resolveSchema(doc, ref)
-		if !ok {
-			return nil, nil, fmt.Errorf("unknown schema ref %s", ref)
-		}
-		schema = resolved
+	schema, err := resolveSchemaDeep(doc, jsonContent.Schema)
+	if err != nil {
+		return nil, nil, err
 	}
 	required := stringSlice(schema["required"])
 	return schema, required, nil
@@ -371,6 +367,78 @@ func listResponseField(doc openAPIDoc, responses map[string]responseDoc) string 
 		}
 	}
 	return ""
+}
+
+func resolveSchemaDeep(doc openAPIDoc, schema map[string]any) (map[string]any, error) {
+	resolved, err := resolveSchemaValue(doc, schema, map[string]bool{})
+	if err != nil {
+		return nil, err
+	}
+	out, ok := resolved.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("resolved schema is not an object")
+	}
+	return out, nil
+}
+
+func resolveSchemaValue(doc openAPIDoc, value any, active map[string]bool) (any, error) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if ref, _ := typed["$ref"].(string); ref != "" {
+			if active[ref] {
+				return nil, fmt.Errorf("schema reference cycle at %s", ref)
+			}
+			target, ok := resolveSchema(doc, ref)
+			if !ok {
+				return nil, fmt.Errorf("unknown schema ref %s", ref)
+			}
+			active[ref] = true
+			resolvedTarget, err := resolveSchemaValue(doc, target, active)
+			if err != nil {
+				delete(active, ref)
+				return nil, err
+			}
+			out, ok := resolvedTarget.(map[string]any)
+			if !ok {
+				delete(active, ref)
+				return nil, fmt.Errorf("resolved schema ref %s is not an object", ref)
+			}
+			for key, item := range typed {
+				if key == "$ref" {
+					continue
+				}
+				resolved, err := resolveSchemaValue(doc, item, active)
+				if err != nil {
+					delete(active, ref)
+					return nil, err
+				}
+				out[key] = resolved
+			}
+			delete(active, ref)
+			return out, nil
+		}
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			resolved, err := resolveSchemaValue(doc, item, active)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = resolved
+		}
+		return out, nil
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			resolved, err := resolveSchemaValue(doc, item, active)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = resolved
+		}
+		return out, nil
+	default:
+		return typed, nil
+	}
 }
 
 func resolveSchema(doc openAPIDoc, ref string) (map[string]any, bool) {

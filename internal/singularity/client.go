@@ -62,7 +62,12 @@ func NewAPIClient(baseURL, token string, timeout time.Duration, opts ...APIClien
 	return client, nil
 }
 
-func (c *APIClient) Call(ctx context.Context, op *Operation, args map[string]any) ([]byte, error) {
+type PreparedCall struct {
+	Operation *Operation
+	Args      map[string]any
+}
+
+func (c *APIClient) PrepareCall(op *Operation, args map[string]any) (*PreparedCall, error) {
 	if op == nil {
 		return nil, NewValidationError("operation is required")
 	}
@@ -72,18 +77,34 @@ func (c *APIClient) Call(ctx context.Context, op *Operation, args map[string]any
 	if args == nil {
 		args = map[string]any{}
 	}
-	normalizedArgs, err := normalizeArgs(op, args)
+	normalizedArgs, err := normalizeArgs(op, cloneArgsDeep(args))
 	if err != nil {
 		return nil, err
 	}
-	args = normalizedArgs
-	if err := validateArgs(op, args); err != nil {
+	if err := validateArgs(op, normalizedArgs); err != nil {
 		return nil, err
 	}
+	return &PreparedCall{Operation: op, Args: normalizedArgs}, nil
+}
+
+func (c *APIClient) Call(ctx context.Context, op *Operation, args map[string]any) ([]byte, error) {
+	prepared, err := c.PrepareCall(op, args)
+	if err != nil {
+		return nil, err
+	}
+	return c.ExecutePrepared(ctx, prepared)
+}
+
+func (c *APIClient) ExecutePrepared(ctx context.Context, prepared *PreparedCall) ([]byte, error) {
+	if prepared == nil || prepared.Operation == nil {
+		return nil, NewValidationError("prepared call is required")
+	}
+	op, args := prepared.Operation, prepared.Args
 	if op.Name == "search" {
 		return c.search(ctx, op, args)
 	}
 	var raw []byte
+	var err error
 	today := localDate(c.now())
 	if isTaskDateListOperation(op.Name) {
 		args = taskDateListArgs(op.Name, args, today)
@@ -578,6 +599,23 @@ func firstArrayField(page map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func cloneArgsDeep(args map[string]any) map[string]any {
+	out := make(map[string]any, len(args))
+	for key, value := range args {
+		switch typed := value.(type) {
+		case map[string]any:
+			out[key] = cloneArgsDeep(typed)
+		case []any:
+			items := make([]any, len(typed))
+			copy(items, typed)
+			out[key] = items
+		default:
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func cloneArgs(args map[string]any) map[string]any {

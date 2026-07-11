@@ -45,6 +45,7 @@ func NewServerWithOptions(client *singularity.APIClient, catalog *singularity.Ca
 		server.WithToolCapabilities(false),
 		server.WithResourceCapabilities(false, false),
 		server.WithRecovery(),
+		server.WithInputSchemaValidation(),
 	}
 	if options.RequireWriteApproval {
 		serverOptions = append(serverOptions, server.WithElicitation())
@@ -102,14 +103,27 @@ func (b Builder) handleTool(ctx context.Context, group *singularity.ToolGroup, r
 	if !ok {
 		return mcp.NewToolResultError(singularity.StructuredError(singularity.NewValidationError("invalid operation: " + operationName))), nil
 	}
-	if approvalResult, proceed := b.requireWriteApproval(ctx, group.ToolName, op, args); !proceed {
-		return approvalResult, nil
-	}
-	raw, err := b.Client.Call(ctx, op, args)
+	prepared, err := b.Client.PrepareCall(op, args)
 	if err != nil {
 		return mcp.NewToolResultError(singularity.StructuredError(err)), nil
 	}
-	return mcp.NewToolResultText(string(raw)), nil
+	if approvalResult, proceed := b.requireWriteApproval(ctx, group.ToolName, op, prepared.Args); !proceed {
+		return approvalResult, nil
+	}
+	raw, err := b.Client.ExecutePrepared(ctx, prepared)
+	if err != nil {
+		return mcp.NewToolResultError(singularity.StructuredError(err)), nil
+	}
+	result := mcp.NewToolResultText(string(raw))
+	var structured any
+	if err := json.Unmarshal(raw, &structured); err != nil {
+		return mcp.NewToolResultError(singularity.StructuredError(fmt.Errorf("decode successful response: %w", err))), nil
+	}
+	if _, ok := structured.(map[string]any); !ok {
+		structured = map[string]any{"result": structured}
+	}
+	result.StructuredContent = structured
+	return result, nil
 }
 
 func (b Builder) requireWriteApproval(ctx context.Context, toolName string, op *singularity.Operation, args map[string]any) (*mcp.CallToolResult, bool) {
@@ -328,106 +342,87 @@ func (b Builder) readResource(ctx context.Context, req mcp.ReadResourceRequest) 
 }
 
 func toolForGroup(group *singularity.ToolGroup) mcp.Tool {
-	schema := map[string]any{
-		"type":                 "object",
-		"additionalProperties": false,
-		"required":             []string{"operation"},
-		"properties": map[string]any{
-			"operation": map[string]any{
-				"type":        "string",
-				"description": "Operation to run.",
-				"enum":        operationNames(group),
-			},
-			"id": map[string]any{
-				"type":        "string",
-				"description": "Entity ID. Required for get, update, and delete.",
-			},
-			"body": map[string]any{
-				"type":                 "object",
-				"description":          "Create/update payload using exact Swagger field names.",
-				"additionalProperties": true,
-			},
-			"confirm": map[string]any{
-				"description": "Use true for single delete, or DELETE for time_stats.delete_bulk.",
-				"oneOf": []map[string]any{
-					{"type": "boolean"},
-					{"type": "string", "enum": []string{"DELETE"}},
-				},
-			},
-			"all": map[string]any{
-				"type":        "boolean",
-				"description": "For list operations, fetch all pages using maxCount=1000.",
-				"default":     false,
-			},
-			"compact": map[string]any{
-				"type":        "boolean",
-				"description": "For list and search operations, return compact entities without large metadata fields. Search defaults to true.",
-				"default":     false,
-			},
-			"query": map[string]any{
-				"type":        "string",
-				"description": "Search text for operation=search. Uses case-insensitive substring matching.",
-			},
-			"fields": map[string]any{
-				"type":        "array",
-				"description": "Fields to search for operation=search. Defaults to title.",
-				"items": map[string]any{
-					"type": "string",
-					"enum": []string{"id", "title", "note"},
-				},
-			},
-			"limit": map[string]any{
-				"type":        "number",
-				"description": "Maximum number of operation=search results. Defaults to 20, max 100.",
-				"default":     20,
-			},
-			"tag": map[string]any{
-				"type":        "string",
-				"description": "Task operation=search filter: match one tag ID exactly.",
-			},
-			"tags": map[string]any{
-				"type":        "array",
-				"description": "Task operation=search filter: match tag IDs exactly.",
-				"items":       map[string]any{"type": "string"},
-			},
-			"tagMode": map[string]any{
-				"type":        "string",
-				"description": "Task operation=search tag matching mode.",
-				"enum":        []string{"any", "all"},
-				"default":     "any",
-			},
-			"checked": map[string]any{
-				"type":        "number",
-				"description": "Task operation=search filter: checked status.",
-			},
-			"priority": map[string]any{
-				"type":        "number",
-				"description": "Task operation=search filter: priority.",
-			},
-		},
-	}
-	props := schema["properties"].(map[string]any)
+	variants := make([]any, 0, len(group.Operations))
 	for _, op := range group.Operations {
-		for _, param := range op.QueryParams {
-			if _, exists := props[param.Name]; exists {
-				continue
-			}
-			props[param.Name] = queryParamSchema(param)
-		}
-		if op.BodySchema != nil {
-			body := cloneSchema(op.BodySchema)
-			body["description"] = "Create/update payload using exact Swagger field names."
-			body["additionalProperties"] = true
-			decorateNoteBodySchema(op, body)
-			props["body"] = body
-		}
+		variants = append(variants, schemaForOperation(op))
 	}
-
-	raw, err := json.Marshal(schema)
+	raw, err := json.Marshal(map[string]any{"type": "object", "oneOf": variants})
 	if err != nil {
 		panic(err)
 	}
-	return mcp.NewToolWithRawSchema(group.ToolName, toolDescription(group), raw)
+	tool := mcp.NewToolWithRawSchema(group.ToolName, toolDescription(group), raw)
+	tool.RawOutputSchema = json.RawMessage(`{"type":"object","additionalProperties":true}`)
+	return tool
+}
+
+func schemaForOperation(op *singularity.Operation) map[string]any {
+	props := map[string]any{"operation": map[string]any{"type": "string", "const": op.Name}}
+	required := []string{"operation"}
+	if op.Name == "get" || op.Name == "update" || op.Name == "delete" {
+		props["id"] = map[string]any{"type": "string", "minLength": 1}
+		required = append(required, "id")
+	}
+	if !isSyntheticTaskListOperation(op) {
+		for _, param := range op.QueryParams {
+			props[param.Name] = queryParamSchema(param)
+			if param.Required {
+				required = append(required, param.Name)
+			}
+		}
+	}
+	if op.BodySchema != nil {
+		body := cloneSchema(op.BodySchema)
+		body["description"] = "Create/update payload using exact Swagger field names."
+		if _, ok := body["properties"].(map[string]any); ok {
+			body["additionalProperties"] = false
+		}
+		decorateNoteBodySchema(op, body)
+		props["body"] = body
+		required = append(required, "body")
+	}
+	switch op.Name {
+	case "delete":
+		props["confirm"] = map[string]any{"type": "boolean", "const": true}
+		required = append(required, "confirm")
+	case "delete_bulk":
+		props["confirm"] = map[string]any{"type": "string", "const": "DELETE"}
+		required = append(required, "confirm")
+	case "list":
+		props["all"] = map[string]any{"type": "boolean", "default": false}
+		props["compact"] = map[string]any{"type": "boolean", "default": false}
+	case "overdue", "today", "only-today":
+		props["compact"] = map[string]any{"type": "boolean", "default": false}
+	case "search":
+		props["all"] = map[string]any{"type": "boolean", "default": true}
+		props["compact"] = map[string]any{"type": "boolean", "default": true}
+		props["query"] = map[string]any{"type": "string"}
+		fields := []string{"id", "title"}
+		if op.Tag == "task" || op.Tag == "project" {
+			fields = append(fields, "note")
+		}
+		props["fields"] = map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": fields}}
+		props["limit"] = map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 20}
+		if op.Tag == "task" {
+			props["tag"] = map[string]any{"type": "string"}
+			props["tags"] = map[string]any{"type": "array", "items": map[string]any{"type": "string"}}
+			props["tagMode"] = map[string]any{"type": "string", "enum": []string{"any", "all"}, "default": "any"}
+			props["checked"] = map[string]any{"type": "integer"}
+			props["priority"] = map[string]any{"type": "integer"}
+		}
+	}
+	return map[string]any{"type": "object", "properties": props, "required": required, "additionalProperties": false}
+}
+
+func isSyntheticTaskListOperation(op *singularity.Operation) bool {
+	if op == nil || op.Tag != "task" {
+		return false
+	}
+	switch op.Name {
+	case "inbox", "overdue", "today", "only-today":
+		return true
+	default:
+		return false
+	}
 }
 
 func queryParamSchema(param singularity.Parameter) map[string]any {
@@ -438,11 +433,30 @@ func queryParamSchema(param singularity.Parameter) map[string]any {
 	if param.Description != "" {
 		schema["description"] = param.Description
 	}
+	if param.Name == "maxCount" || param.Name == "offset" {
+		schema["type"] = "integer"
+	}
 	return schema
 }
 
 func toolDescription(group *singularity.ToolGroup) string {
-	return "Run Singularity " + group.Tag + " operations."
+	reads := make([]string, 0, len(group.Operations))
+	writes := make([]string, 0, len(group.Operations))
+	for _, op := range group.Operations {
+		if operationRequiresApproval(op) {
+			writes = append(writes, op.Name)
+		} else {
+			reads = append(reads, op.Name)
+		}
+	}
+	description := "Run Singularity " + group.Tag + " operations."
+	if len(reads) > 0 {
+		description += " Read: " + strings.Join(reads, ", ") + "."
+	}
+	if len(writes) > 0 {
+		description += " Write: " + strings.Join(writes, ", ") + "."
+	}
+	return description
 }
 
 func operationNames(group *singularity.ToolGroup) []string {
@@ -480,9 +494,15 @@ func capabilities(catalog *singularity.Catalog, requireWriteApproval bool) map[s
 		})
 	}
 	return map[string]any{
-		"tools":                tools,
-		"omittedTags":          catalog.OmittedTags,
-		"operationSet":         map[string]any{"totalSwagger": catalog.TotalOperations, "exposed": catalog.ExposedOperationCount()},
+		"tools":       tools,
+		"omittedTags": catalog.OmittedTags,
+		"operationSet": map[string]any{
+			"swaggerTotal":   catalog.TotalOperations,
+			"swaggerExposed": 41,
+			"synthetic":      7,
+			"omitted":        catalog.TotalOperations - 41,
+			"exposedTotal":   catalog.ExposedOperationCount(),
+		},
 		"requireWriteApproval": requireWriteApproval,
 	}
 }
